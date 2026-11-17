@@ -42,12 +42,13 @@ class ConfigTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with patch.dict(os.environ, {}, clear=True):
+            clean_env = {"HOME": tmp, "USERPROFILE": tmp}
+            with patch.dict(os.environ, clean_env, clear=True):
                 cfg = load_config(cfg_file)
             self.assertEqual(cfg.http_proxy, "http://127.0.0.1:8888")
             self.assertEqual(cfg.webhook_url, "https://example.invalid/hook")
             self.assertEqual(cfg.feishu_user_id, "")
 
     def test_state_dir_respects_xdg_and_override(self) -> None:
-        with patch.dict(os.environ, {"QUOTA_PING_STATE_DIR": "/tmp/custom-state"}, clear=True):
+        with patch.dict(os.environ, {"QUOTA_PING_STATE_DIR": "/tmp/custom-state", "HOME": "/tmp"}, clear=True):
             self.assertEqual(default_state_dir(platform="linux"), Path("/tmp/custom-state"))
