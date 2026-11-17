@@ -1,0 +1,24 @@
+{
+  "proxy": {
+    "http_proxy": "",
+    "all_proxy": "",
+    "no_proxy": "localhost,127.0.0.1,::1"
+  },
+  "claude": {
+    "bin": "",
+    "guard_bin": "",
+    "clear_proxy_env": false
+  },
+  "codex": {
+    "bin": ""
+  },
+  "agy": {
+    "bin": ""
+  },
+  "notify": {
+    "lark_bin": "",
+    "feishu_user_id": "",
+    "feishu_chat_id": "",
+    "webhook_url": ""
+  }
+}

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SELF="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+ROOT="$(cd "$(dirname "$SELF")/.." && pwd)"
+export PYTHONPATH="${ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+
+PYTHON_BIN="${QUOTA_PING_PYTHON:-}"
+if [ -z "$PYTHON_BIN" ]; then
+  for candidate in /usr/bin/python3 /opt/homebrew/bin/python3 /usr/local/bin/python3; do
+    if [ -x "$candidate" ]; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
+
+exec "$PYTHON_BIN" -m agents_quota_ping "$@"

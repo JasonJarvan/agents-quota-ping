@@ -1,0 +1,6 @@
+[Unit]
+Description=agents-quota-ping 5-hour quota window warmer
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/quota-ping
