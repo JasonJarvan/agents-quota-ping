@@ -119,7 +119,13 @@ def prepare_command_argv(argv: list[str], platform: str | None = None) -> list[s
 
 @dataclass(frozen=True)
 class AppConfig:
-    """Resolved runtime configuration combining defaults, JSON config, and env vars."""
+    """Resolved runtime configuration combining defaults, JSON config, and env vars.
+
+    ``lock_file`` is the legacy global lock path. Live runs lock
+    ``state_dir / run-<provider>.lock`` instead, so one provider's follow-up
+    never blocks the others. Follow-up policy is ``followup_enabled`` /
+    ``followup_cutoff`` plus a seconds-based jitter range.
+    """
 
     state_dir: Path
     empty_workdir: Path
@@ -141,6 +147,35 @@ class AppConfig:
     feishu_chat_id: str = ""
     webhook_url: str = ""
     search_path: str = field(default_factory=build_search_path)
+    # One-shot follow-up after a measured reset. Jitter bounds are seconds.
+    followup_enabled: bool = True
+    followup_cutoff: str = "18:30"
+    followup_jitter_min: int = 15
+    followup_jitter_max: int = 45
+
+
+def _coerce_bool(value: object, default: bool) -> bool:
+    """Parse a JSON or env boolean without treating the string ``"false"`` as true."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
+
+
+def _coerce_int(value: object, default: int) -> int:
+    """Parse an integer config value, falling back when the input is unusable."""
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
 
 
 def _read_json_dict(path: Path) -> dict:
@@ -163,6 +198,7 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     codex_raw = raw.get("codex") if isinstance(raw.get("codex"), dict) else {}
     agy_raw = raw.get("agy") if isinstance(raw.get("agy"), dict) else {}
     notify_raw = raw.get("notify") if isinstance(raw.get("notify"), dict) else {}
+    schedule_raw = raw.get("schedule") if isinstance(raw.get("schedule"), dict) else {}
 
     state_dir = default_state_dir()
     home = Path.home()
@@ -181,6 +217,17 @@ def load_config(config_path: Path | None = None) -> AppConfig:
 
     claude_guard = os.environ.get("QUOTA_PING_CLAUDE_GUARD_BIN", str(claude_raw.get("guard_bin", ""))).strip()
     clear_proxy_env = bool(claude_raw.get("clear_proxy_env", False))
+
+    followup_enabled = _coerce_bool(schedule_raw.get("followup_enabled", True), True)
+    followup_env = os.environ.get("QUOTA_PING_FOLLOWUP_ENABLED", "").strip()
+    if followup_env:
+        followup_enabled = _coerce_bool(followup_env, followup_enabled)
+    followup_cutoff = str(schedule_raw.get("followup_cutoff", "18:30") or "18:30").strip() or "18:30"
+    cutoff_env = os.environ.get("QUOTA_PING_FOLLOWUP_CUTOFF", "").strip()
+    if cutoff_env:
+        followup_cutoff = cutoff_env
+    followup_jitter_min = _coerce_int(schedule_raw.get("followup_jitter_min", 15), 15)
+    followup_jitter_max = _coerce_int(schedule_raw.get("followup_jitter_max", 45), 45)
 
     return AppConfig(
         state_dir=state_dir,
@@ -203,6 +250,10 @@ def load_config(config_path: Path | None = None) -> AppConfig:
         feishu_chat_id=os.environ.get("QUOTA_PING_FEISHU_CHAT_ID", str(notify_raw.get("feishu_chat_id", ""))).strip(),
         webhook_url=os.environ.get("QUOTA_PING_WEBHOOK_URL", str(notify_raw.get("webhook_url", ""))).strip(),
         search_path=search_path,
+        followup_enabled=followup_enabled,
+        followup_cutoff=followup_cutoff,
+        followup_jitter_min=followup_jitter_min,
+        followup_jitter_max=followup_jitter_max,
     )
 
 

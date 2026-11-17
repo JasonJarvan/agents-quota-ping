@@ -12,6 +12,7 @@ import urllib.request
 from agents_quota_ping.classify import extract_error_summary
 from agents_quota_ping.config import AppConfig, feishu_env, prepare_command_argv
 from agents_quota_ping.providers import PingResult
+from agents_quota_ping.scheduler import concise_followup_note
 
 
 def _format_reset_fallback(finished_at: datetime) -> str:
@@ -82,6 +83,9 @@ def format_report(
             extras.append(res.usage.format_short())
         if quota_str and res.status != "skipped":
             extras.append(quota_str)
+        note = concise_followup_note(res.followup_note)
+        if note:
+            extras.append(note)
         suffix = f" · {' · '.join(extras)}" if extras else ""
         lines.append(f"- {icon} **{label}**: {state}{suffix}")
 

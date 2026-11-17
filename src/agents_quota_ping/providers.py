@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
-from typing import Callable
+from typing import Callable, Iterator
 
 from agents_quota_ping.classify import (
     ErrorKind,
@@ -18,7 +20,7 @@ from agents_quota_ping.classify import (
     pick_codex_fallback_models,
 )
 from agents_quota_ping.config import AppConfig, claude_env, prepare_command_argv, proxy_env
-from agents_quota_ping.quota import QuotaSnapshot, probe_quota
+from agents_quota_ping.quota import QuotaSnapshot, parse_iso_utc, probe_quota
 
 
 @dataclass(frozen=True)
@@ -72,10 +74,89 @@ class PingResult:
     detail: str = ""
     usage: TokenUsage | None = None
     quota: QuotaSnapshot | None = None
+    followup_note: str = ""
 
 
 # (returncode, stdout, stderr, timed_out)
 RunCmd = Callable[[list[str], dict[str, str], Path, int], tuple[int | None, str, str, bool]]
+
+# Suppress a second ping when a follow-up lands next to a fixed cron run.
+_RECENT_PING = timedelta(minutes=15)
+
+
+@contextmanager
+def acquire_lock(lock_path: Path) -> Iterator[bool]:
+    """Acquire a non-blocking cross-platform advisory file lock.
+
+    Yields ``True`` when this process holds the lock. Yields ``False`` when
+    another live process already holds it; callers should skip rather than wait.
+    """
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = lock_path.open("a+", encoding="utf-8")
+    acquired = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                acquired = False
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError:
+                acquired = False
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        fh.close()
+
+
+def last_ping_path(cfg: AppConfig, name: str) -> Path:
+    """Return the per-provider receipt path (``last-ping-<name>.json``)."""
+    return cfg.state_dir / f"last-ping-{name}.json"
+
+
+def load_last_ping_at(cfg: AppConfig, name: str) -> datetime | None:
+    """Return the UTC time of the last real ping for ``name``, if the receipt is readable."""
+    path = last_ping_path(cfg, name)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    stamp = raw.get("last_ping_at")
+    return parse_iso_utc(stamp if isinstance(stamp, str) else None)
+
+
+def record_last_ping(cfg: AppConfig, name: str, when: datetime | None = None) -> None:
+    """Persist ``last_ping_at`` so a follow-up and a fixed cron do not double-ping."""
+    moment = when or datetime.now(timezone.utc)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    path = last_ping_path(cfg, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_ping_at": moment.astimezone(timezone.utc).isoformat(timespec="seconds")}
+    path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
 def default_run_cmd(
@@ -205,12 +286,25 @@ def should_skip_preflight(
     snap: QuotaSnapshot,
     now_utc: datetime | None = None,
     skip_if_active: bool = True,
+    last_ping_at: datetime | None = None,
 ) -> str | None:
-    """Decide whether to skip pinging based on live quota API state; returns skip reason or None."""
+    """Decide whether to skip pinging based on live quota API state; returns skip reason or None.
+
+    A ping recorded within the last 15 minutes is skipped so a one-shot follow-up
+    and the fixed cron do not both hit the provider. Codex ``used_percent`` can
+    still round to 0% right after a real ping, which would otherwise look unused.
+    ``--force`` bypasses this by turning preflight off.
+    """
+    now = datetime.now(timezone.utc) if now_utc is None else now_utc
+    if last_ping_at is not None:
+        ping_at = last_ping_at if last_ping_at.tzinfo is not None else last_ping_at.replace(tzinfo=timezone.utc)
+        now_aware = now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+        age = now_aware.astimezone(timezone.utc) - ping_at.astimezone(timezone.utc)
+        if timedelta(0) <= age <= _RECENT_PING:
+            return f"刚刚已触发过 ({ping_at.astimezone():%H:%M:%S})"
+
     if snap.error and snap.reset_at is None and snap.remaining_percent is None:
         return None
-
-    now = datetime.now(timezone.utc) if now_utc is None else now_utc
     if snap.remaining_percent is not None and snap.remaining_percent <= 0:
         if snap.reset_at is not None:
             return f"配额已耗尽 (0% 剩余，等待 {snap.reset_at.astimezone():%H:%M:%S} 重置)"
@@ -623,6 +717,62 @@ def run_single_provider(
     preflight: bool = True,
     skip_if_active: bool = True,
 ) -> PingResult:
+    """Run one provider under its own lock, then record a receipt when a ping really ran.
+
+    The lock file is ``state_dir/run-<provider>.lock``. A Claude follow-up therefore
+    never skips or blocks Codex or Antigravity. ``ok`` and ``degraded`` write
+    ``last-ping-<provider>.json``; skips and hard failures do not.
+    """
+    label_map = {"claude": "Claude", "codex": "Codex", "agy": "Antigravity"}
+    if name not in label_map:
+        raise ValueError(f"Unknown provider: {name}")
+    provider_label = label_map[name]
+
+    with acquire_lock(cfg.state_dir / f"run-{name}.lock") as acquired:
+        if not acquired:
+            log_fn(f"⏭ {provider_label} skipped (另一实例正在运行)")
+            return PingResult(
+                provider=provider_label,
+                status="skipped",
+                tier=0,
+                model="lock-skip",
+                elapsed_sec=0.0,
+                detail="另一实例正在运行",
+            )
+        result = _run_single_provider_locked(
+            name,
+            cfg,
+            base_env,
+            run_cmd=run_cmd,
+            quota_probe=quota_probe,
+            timeout_sec=timeout_sec,
+            retry_delay_sec=retry_delay_sec,
+            sleep_fn=sleep_fn,
+            log_fn=log_fn,
+            preflight=preflight,
+            skip_if_active=skip_if_active,
+        )
+        if result.status in ("ok", "degraded"):
+            try:
+                record_last_ping(cfg, name)
+            except OSError as exc:
+                log_fn(f"ℹ {provider_label} 未能记录最近触发时间: {exc}")
+        return result
+
+
+def _run_single_provider_locked(
+    name: str,
+    cfg: AppConfig,
+    base_env: dict[str, str],
+    run_cmd: RunCmd = default_run_cmd,
+    quota_probe: Callable[[str, AppConfig], QuotaSnapshot] = probe_quota,
+    timeout_sec: int = 90,
+    retry_delay_sec: float = 8.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    log_fn: Callable[[str], None] = lambda _msg: None,
+    preflight: bool = True,
+    skip_if_active: bool = True,
+) -> PingResult:
     """Run pre-flight quota check, ping if needed, and measure post-ping reset time."""
     label_map = {"claude": "Claude", "codex": "Codex", "agy": "Antigravity"}
     if name not in label_map:
@@ -631,7 +781,11 @@ def run_single_provider(
 
     if preflight:
         pre_snap = quota_probe(name, cfg)
-        skip_reason = should_skip_preflight(pre_snap, skip_if_active=skip_if_active)
+        skip_reason = should_skip_preflight(
+            pre_snap,
+            skip_if_active=skip_if_active,
+            last_ping_at=load_last_ping_at(cfg, name),
+        )
         if skip_reason:
             log_fn(f"⏭ {provider_label} skipped ({skip_reason})")
             return PingResult(

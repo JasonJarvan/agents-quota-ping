@@ -1,5 +1,6 @@
 """Tests for pre-flight checks, retry, fallback execution, and JSON token usage extraction."""
 
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tempfile
@@ -23,7 +24,16 @@ class ProviderExecutionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.workdir = Path(self.tmp.name)
-        self.cfg = load_config(self.workdir / "missing-config.json")
+        loaded = load_config(self.workdir / "missing-config.json")
+        empty = self.workdir / "empty"
+        empty.mkdir()
+        self.cfg = replace(
+            loaded,
+            state_dir=self.workdir,
+            empty_workdir=empty,
+            lock_file=self.workdir / "run.lock",
+            log_file=self.workdir / "quota-ping.log",
+        )
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

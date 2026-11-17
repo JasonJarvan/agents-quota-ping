@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
 from datetime import datetime
 import json
 from pathlib import Path
@@ -13,10 +12,10 @@ import shlex
 import sys
 import threading
 import time
-from typing import Iterator
 
 from agents_quota_ping.config import AppConfig, base_cron_env, load_config
 from agents_quota_ping.notify import format_report, send_notifications
+from agents_quota_ping.scheduler import attach_followup, concise_followup_note
 from agents_quota_ping.providers import (
     PingResult,
     build_agy_tier1,
@@ -29,48 +28,6 @@ from agents_quota_ping.quota import QuotaSnapshot, probe_quota
 ALL_PROVIDERS = ("claude", "codex", "agy")
 PROVIDER_DISPLAY = {"claude": "Claude", "codex": "Codex", "agy": "Antigravity"}
 MAX_LOG_BYTES = 1024 * 1024
-
-
-@contextmanager
-def acquire_lock(lock_path: Path) -> Iterator[bool]:
-    """Acquire a non-blocking cross-platform advisory file lock."""
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh = lock_path.open("a+", encoding="utf-8")
-    acquired = False
-    try:
-        if sys.platform == "win32":
-            import msvcrt
-
-            try:
-                fh.seek(0)
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
-            except OSError:
-                acquired = False
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except BlockingIOError:
-                acquired = False
-        yield acquired
-    finally:
-        if acquired:
-            try:
-                if sys.platform == "win32":
-                    import msvcrt
-
-                    fh.seek(0)
-                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-        fh.close()
 
 
 def rotate_log_if_needed(log_path: Path, max_bytes: int = MAX_LOG_BYTES) -> None:
@@ -143,6 +100,9 @@ def _serialize_results(results: list[PingResult], finished_at: datetime, codex_p
                 "secondary_used_percent": r.quota.secondary_used_percent,
                 "error": r.quota.error or None,
             }
+        note = concise_followup_note(r.followup_note)
+        if note:
+            entry["followup_note"] = note
         items.append(entry)
     return {
         "finished_at": finished_at.astimezone().isoformat(),
@@ -179,6 +139,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--json", action="store_true", help="Print structured JSON summary to stdout")
     parser.add_argument("--no-jitter", action="store_true", help="Skip startup random sleep")
+    parser.add_argument(
+        "--delay-seconds",
+        type=int,
+        default=0,
+        help="Extra startup delay in seconds (launchd follow-ups wait out the remainder of the target minute)",
+    )
+    parser.add_argument("--no-followup", action="store_true", help="Do not register an OS one-shot follow-up")
+    parser.add_argument(
+        "--followup-cutoff",
+        default="",
+        help="Local HH:MM cutoff; follow-ups after this stay on the next 07:00 run (default: config or 18:30)",
+    )
     parser.add_argument("--min-jitter", type=int, default=10, help="Min jitter seconds (default: 10)")
     parser.add_argument("--max-jitter", type=int, default=25, help="Max jitter seconds (default: 25)")
     parser.add_argument("--timeout", type=int, default=90, help="Per-command timeout in seconds (default: 90)")
@@ -240,43 +212,54 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     log = make_logger(cfg.log_file, quiet_stdout=args.json)
-    with acquire_lock(cfg.lock_file) as acquired:
-        if not acquired:
-            log("Another quota-ping instance is already running; skipping.")
-            return 0
+    jitter_sec = 0
+    if not args.no_jitter and args.max_jitter >= args.min_jitter and args.max_jitter > 0:
+        jitter_sec = random.randint(max(0, args.min_jitter), args.max_jitter)
+        if jitter_sec > 0:
+            log(f"Sleep {jitter_sec}s jitter")
+            time.sleep(jitter_sec)
 
-        jitter_sec = 0
-        if not args.no_jitter and args.max_jitter >= args.min_jitter and args.max_jitter > 0:
-            jitter_sec = random.randint(max(0, args.min_jitter), args.max_jitter)
-            if jitter_sec > 0:
-                log(f"Sleep {jitter_sec}s jitter")
-                time.sleep(jitter_sec)
+    delay_sec = args.delay_seconds if args.delay_seconds > 0 else 0
+    if delay_sec:
+        log(f"Delay {delay_sec}s before ping")
+        time.sleep(delay_sec)
 
-        env = base_cron_env(cfg)
-        results = _run_parallel_providers(
-            selected,
-            lambda name: run_single_provider(
-                name,
-                cfg,
-                env,
-                timeout_sec=args.timeout,
-                log_fn=log,
-                preflight=not args.force,
-                skip_if_active=not args.no_skip_active,
-            ),
+    env = base_cron_env(cfg)
+    followup_on = cfg.followup_enabled and not args.no_followup
+    cutoff = args.followup_cutoff.strip() or cfg.followup_cutoff
+
+    def worker(name: str) -> PingResult:
+        result = run_single_provider(
+            name,
+            cfg,
+            env,
+            timeout_sec=args.timeout,
+            log_fn=log,
+            preflight=not args.force,
+            skip_if_active=not args.no_skip_active,
+        )
+        return attach_followup(
+            name,
+            result,
+            cfg,
+            enabled=followup_on,
+            cutoff_hhmm=cutoff,
+            log_fn=log,
         )
 
-        finished_at = datetime.now()
-        report = format_report(
-            results,
-            finished_at=finished_at,
-            codex_profile=codex_profile,
-            jitter_sec=jitter_sec,
-        )
-        if args.json:
-            print(json.dumps(_serialize_results(results, finished_at, codex_profile), indent=2, ensure_ascii=False))
+    results = _run_parallel_providers(selected, worker)
 
-        if not args.no_notify:
-            send_notifications(report, cfg, base_env=env, log_fn=log)
+    finished_at = datetime.now()
+    report = format_report(
+        results,
+        finished_at=finished_at,
+        codex_profile=codex_profile,
+        jitter_sec=jitter_sec,
+    )
+    if args.json:
+        print(json.dumps(_serialize_results(results, finished_at, codex_profile), indent=2, ensure_ascii=False))
 
-        return 1 if any(r.status == "fail" for r in results) else 0
+    if not args.no_notify:
+        send_notifications(report, cfg, base_env=env, log_fn=log)
+
+    return 1 if any(r.status == "fail" for r in results) else 0

@@ -15,6 +15,12 @@
   "agy": {
     "bin": ""
   },
+  "schedule": {
+    "followup_enabled": true,
+    "followup_cutoff": "18:30",
+    "followup_jitter_min": 15,
+    "followup_jitter_max": 45
+  },
   "notify": {
     "lark_bin": "",
     "feishu_user_id": "",

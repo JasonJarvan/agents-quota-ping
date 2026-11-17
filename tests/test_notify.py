@@ -72,6 +72,36 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("⏭", msg)
         self.assertNotIn("异常/降级详情", msg)
 
+    def test_format_includes_concise_followup_note(self) -> None:
+        dt = datetime(2026, 11, 17, 12, 0, 0)
+        msg = format_report(
+            [
+                PingResult("Claude", "ok", 1, "haiku", 1.0, followup_note="已预约 14:30:22"),
+                PingResult(
+                    "Codex",
+                    "skipped",
+                    0,
+                    "preflight-skip",
+                    0.0,
+                    detail="配额已耗尽",
+                    followup_note="已过当日截止 18:30，交由次日 07:00 定时",
+                ),
+                PingResult(
+                    "Antigravity",
+                    "ok",
+                    1,
+                    "gemini-3.8-flash-low",
+                    1.0,
+                    followup_note="冷却期 >5.5h，交由常规 07:00 定时兜底",
+                ),
+            ],
+            finished_at=dt,
+        )
+        self.assertIn("已预约 14:30:22", msg)
+        self.assertIn(">18:30 不预约", msg)
+        self.assertIn(">5.5h 不预约", msg)
+        self.assertNotIn("交由次日", msg)
+
     def test_send_feishu_falls_back_from_bot_to_user_and_disables_proxy(self) -> None:
         calls: list[tuple[list[str], dict[str, str]]] = []
 

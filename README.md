@@ -51,6 +51,8 @@ Running naive commands like `claude -p "OK"` or `codex exec "OK"` in a cron job 
   - Pure Python 3.10+ standard library; runs on **Linux**, **macOS**, and **Windows** (`fcntl` / `msvcrt` file lock, `.cmd`/`.bat` shim handling, XDG / `%APPDATA%` paths, macOS Keychain fallback for Claude OAuth).
 - **Optional Notifications**
   - Notifications are **100% optional** — works standalone with stdout/log/`--json`, or notifies via generic **Webhook** (Slack, Discord, Feishu custom bot, etc.) or **Feishu (`lark-cli`)** DM/group chat.
+- **Independent OS follow-up**
+  - After a run, registers a per-provider one-shot at `reset_at` plus 15–45 seconds when that reset is within 5.5 hours and still before the local cutoff (default 18:30). Linux uses `systemd-run --user`, macOS `launchd`, Windows Task Scheduler. The process does not sleep until the reset. `--no-followup` disables it.
 
 ---
 
@@ -117,6 +119,12 @@ By default `quota-ping` works out of the box with no config file (logs to OS sta
   "agy": {
     "bin": ""
   },
+  "schedule": {
+    "followup_enabled": true,
+    "followup_cutoff": "18:30",
+    "followup_jitter_min": 15,
+    "followup_jitter_max": 45
+  },
   "notify": {
     "lark_bin": "",
     "feishu_user_id": "",
@@ -126,7 +134,7 @@ By default `quota-ping` works out of the box with no config file (logs to OS sta
 }
 ```
 
-Environment variable overrides: `QUOTA_PING_CONFIG`, `QUOTA_PING_STATE_DIR`, `QUOTA_PING_HTTP_PROXY`, `QUOTA_PING_ALL_PROXY`, `QUOTA_PING_WEBHOOK_URL`, `QUOTA_PING_FEISHU_USER_ID`, `QUOTA_PING_FEISHU_CHAT_ID`, `QUOTA_PING_CLAUDE_BIN`, `QUOTA_PING_CODEX_BIN`, `QUOTA_PING_AGY_BIN`, `QUOTA_PING_LARK_BIN`.
+Environment variable overrides: `QUOTA_PING_CONFIG`, `QUOTA_PING_STATE_DIR`, `QUOTA_PING_HTTP_PROXY`, `QUOTA_PING_ALL_PROXY`, `QUOTA_PING_WEBHOOK_URL`, `QUOTA_PING_FEISHU_USER_ID`, `QUOTA_PING_FEISHU_CHAT_ID`, `QUOTA_PING_CLAUDE_BIN`, `QUOTA_PING_CODEX_BIN`, `QUOTA_PING_AGY_BIN`, `QUOTA_PING_LARK_BIN`, `QUOTA_PING_FOLLOWUP_ENABLED`, `QUOTA_PING_FOLLOWUP_CUTOFF`.
 
 ---
 
@@ -148,6 +156,10 @@ quota-ping --no-jitter --force
 
 # Ping only selected providers
 quota-ping --only claude,codex --no-jitter
+
+# Skip the per-provider one-shot, or move the same-day cutoff
+quota-ping --no-followup
+quota-ping --followup-cutoff 19:00
 ```
 
 Example report:
@@ -208,6 +220,28 @@ powershell -ExecutionPolicy Bypass -File .\contrib\windows-task-scheduler.ps1
 The provided [`contrib/windows-task-scheduler.ps1`](contrib/windows-task-scheduler.ps1) configures daily `07:00`, `12:02`, and `17:04` triggers with `-StartWhenAvailable` and battery-friendly flags.
 
 > **Windows tip**: If your CLIs live inside **WSL2**, run the Linux `cron` or `systemd` setup inside WSL2 instead of native Windows Task Scheduler.
+
+### Independent one-shot follow-up
+
+The fixed clocks (`07:00`, `12:02`, `17:04`) stay in place. After each real run, `quota-ping` can also register a **per-provider OS one-shot** for shortly after the measured `reset_at`. The operating system fires that run (`systemd-run --user`, `launchd`, or Task Scheduler). This process does **not** sleep until the reset.
+
+A follow-up is registered only when:
+
+- The attempt was not a hard failure, and `reset_at` is known.
+- `0 < reset_at - now ≤ 5h30m`. Longer cooldowns stay on the next `07:00` run (`>5.5h 不预约`).
+- `reset_at` plus a random **15–45 second** jitter is still **today** and not later than the cutoff (**18:30** local time by default). Later than that is left to the next morning (`>18:30 不预约`).
+- A pre-flight skip still schedules when the window is exhausted (`remaining == 0`) or already active (`used > 0`) inside that horizon. A skip with no percent data does not.
+
+Each provider gets its own timer (`--only <provider> --no-jitter`), so `--only claude` never blocks Codex or Antigravity. Registering again **replaces** that provider's previous timer. `last-ping-<provider>.json` records the UTC time of an `ok` or `degraded` ping and skips another ping within **15 minutes** unless `--force`, so a follow-up sitting next to a fixed cron does not double-ping while Codex `used_percent` is still rounding to `0%`.
+
+macOS `launchd` is minute-granular. The agent is loaded at the start of the target minute with `--delay-seconds` for the remainder, so the ping itself is not early.
+
+```bash
+quota-ping --no-followup
+quota-ping --followup-cutoff 19:00
+```
+
+`schedule` in `config.json`: `followup_enabled` (default `true`), `followup_cutoff` (default `"18:30"`), `followup_jitter_min` / `followup_jitter_max` (seconds, default `15` and `45`). Overrides: `QUOTA_PING_FOLLOWUP_ENABLED`, `QUOTA_PING_FOLLOWUP_CUTOFF`.
 
 ---
 
