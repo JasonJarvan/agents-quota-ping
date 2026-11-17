@@ -1,8 +1,9 @@
-"""Provider command definitions, JSON token parsing, retry, and dynamic fallback."""
+"""Provider command definitions, pre-flight checks, JSON token parsing, and fallback."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import subprocess
@@ -37,9 +38,13 @@ class TokenUsage:
         return self.input_tokens + self.cached_tokens + self.cache_create_tokens + self.output_tokens
 
     def format_short(self) -> str:
-        """Format compact token + optional USD summary."""
-        inp = self.input_tokens + self.cached_tokens + self.cache_create_tokens
-        base = f"{self.total()} tok (in {inp}/out {self.output_tokens})"
+        """Format compact token breakdown (uncached vs cached) and optional USD cost."""
+        fresh_in = self.input_tokens + self.cache_create_tokens
+        if self.cached_tokens > 0:
+            in_part = f"in {fresh_in}+cache {self.cached_tokens}"
+        else:
+            in_part = f"in {fresh_in}"
+        base = f"{self.total()} tok ({in_part}/out {self.output_tokens})"
         if self.cost_usd is not None:
             return f"{base}, ~${self.cost_usd:.5f}"
         return base
@@ -57,10 +62,10 @@ class CommandTier:
 
 @dataclass(frozen=True)
 class PingResult:
-    """Outcome of pinging a single provider."""
+    """Outcome of pinging (or smart-skipping) a single provider."""
 
     provider: str
-    status: str  # "ok" | "degraded" | "fail"
+    status: str  # "ok" | "degraded" | "skipped" | "fail"
     tier: int
     model: str
     elapsed_sec: float
@@ -196,6 +201,37 @@ def _parse_usage_for(provider_key: str, stdout: str) -> TokenUsage | None:
     return None
 
 
+def should_skip_preflight(
+    snap: QuotaSnapshot,
+    now_utc: datetime | None = None,
+    skip_if_active: bool = True,
+) -> str | None:
+    """Decide whether to skip pinging based on live quota API state; returns skip reason or None."""
+    if snap.error and snap.reset_at is None and snap.remaining_percent is None:
+        return None
+
+    now = datetime.now(timezone.utc) if now_utc is None else now_utc
+    if snap.remaining_percent is not None and snap.remaining_percent <= 0:
+        if snap.reset_at is not None:
+            return f"配额已耗尽 (0% 剩余，等待 {snap.reset_at.astimezone():%H:%M:%S} 重置)"
+        return "配额已耗尽 (0% 剩余)"
+
+    if snap.reset_at is not None and snap.reset_at > now + timedelta(hours=5, minutes=30):
+        return f"处于长周期冷却 (重置 {snap.reset_at.astimezone():%Y-%m-%d %H:%M})"
+
+    # Only skip an active 5h window when used_percent > 0 (unused 0% windows often return a floating now+5h).
+    if (
+        skip_if_active
+        and snap.used_percent is not None
+        and snap.used_percent > 0
+        and snap.reset_at is not None
+        and snap.reset_at > now + timedelta(seconds=60)
+    ):
+        return f"5h 窗口已激活 (已用 {snap.used_percent}%，{snap.reset_at.astimezone():%H:%M:%S} 重置)"
+
+    return None
+
+
 def build_claude_tiers(cfg: AppConfig) -> list[CommandTier]:
     """Build Tier 1/2/3 command list for Claude Code."""
     return [
@@ -258,6 +294,24 @@ def build_claude_tiers(cfg: AppConfig) -> list[CommandTier]:
     ]
 
 
+_CODEX_DISABLE_TOOLS = (
+    "--disable",
+    "apps",
+    "--disable",
+    "shell_tool",
+    "--disable",
+    "view_image",
+    "--disable",
+    "skill_search",
+    "--disable",
+    "computer_use",
+    "--disable",
+    "browser_use",
+    "--disable",
+    "sleep_tool",
+)
+
+
 def build_codex_tiers(cfg: AppConfig, workdir: Path) -> list[CommandTier]:
     """Build Tier 1/2/3 command list for Codex CLI."""
     models_cache = cfg.codex_home / "models_cache.json"
@@ -280,13 +334,37 @@ def build_codex_tiers(cfg: AppConfig, workdir: Path) -> list[CommandTier]:
                 "--skip-git-repo-check",
                 "--sandbox",
                 "read-only",
+                *_CODEX_DISABLE_TOOLS,
                 "--json",
                 "-C",
                 str(workdir),
                 "Reply OK",
             ],
-            note="cheapest Luna model + config/hooks/MCP ignored",
-        )
+            note="cheapest Luna model + config/hooks/MCP/non-essential tools disabled",
+        ),
+        CommandTier(
+            tier=2,
+            model="gpt-6-luna",
+            argv=[
+                cfg.codex_bin,
+                "exec",
+                "-m",
+                "gpt-6-luna",
+                "-c",
+                'model_reasoning_effort="low"',
+                "--ephemeral",
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--skip-git-repo-check",
+                "--sandbox",
+                "read-only",
+                "--json",
+                "-C",
+                str(workdir),
+                "Reply OK",
+            ],
+            note="gpt-6-luna without --disable feature flags",
+        ),
     ]
 
     fallbacks = pick_codex_fallback_models(models_cache, exclude={"gpt-6-luna"})
@@ -542,8 +620,30 @@ def run_single_provider(
     retry_delay_sec: float = 8.0,
     sleep_fn: Callable[[float], None] = time.sleep,
     log_fn: Callable[[str], None] = lambda _msg: None,
+    preflight: bool = True,
+    skip_if_active: bool = True,
 ) -> PingResult:
-    """Dispatch execution + post-ping real quota API measurement for one provider."""
+    """Run pre-flight quota check, ping if needed, and measure post-ping reset time."""
+    label_map = {"claude": "Claude", "codex": "Codex", "agy": "Antigravity"}
+    if name not in label_map:
+        raise ValueError(f"Unknown provider: {name}")
+    provider_label = label_map[name]
+
+    if preflight:
+        pre_snap = quota_probe(name, cfg)
+        skip_reason = should_skip_preflight(pre_snap, skip_if_active=skip_if_active)
+        if skip_reason:
+            log_fn(f"⏭ {provider_label} skipped ({skip_reason})")
+            return PingResult(
+                provider=provider_label,
+                status="skipped",
+                tier=0,
+                model="preflight-skip",
+                elapsed_sec=0.0,
+                detail=skip_reason,
+                quota=pre_snap,
+            )
+
     if name == "claude":
         env = claude_env(cfg, base_env)
         tiers = build_claude_tiers(cfg)
@@ -576,7 +676,7 @@ def run_single_provider(
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
-    elif name == "agy":
+    else:
         env = proxy_env(cfg, base_env)
         tier1 = build_agy_tier1(cfg)
         res = execute_with_fallback(
@@ -592,8 +692,6 @@ def run_single_provider(
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
-    else:
-        raise ValueError(f"Unknown provider: {name}")
 
     snap = quota_probe(name, cfg)
     if snap.error:

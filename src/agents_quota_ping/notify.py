@@ -57,7 +57,7 @@ def format_report(
             quota_str = res.quota.format_summary()
         elif res.quota and res.quota.error:
             quota_str = f"{_format_reset_fallback(finished_at)} (API: {res.quota.error})"
-        elif not status_only and res.status != "fail":
+        elif not status_only and res.status not in ("fail", "skipped"):
             quota_str = _format_reset_fallback(finished_at)
 
         if status_only:
@@ -70,6 +70,9 @@ def format_report(
         elif res.status == "degraded":
             icon = "⚠"
             state = f"降级 Tier {res.tier} `{res.model}` ({res.elapsed_sec:.1f}s)"
+        elif res.status == "skipped":
+            icon = "⏭"
+            state = f"跳过 ({res.detail})"
         else:
             icon = "✗"
             state = f"FAIL `{res.model}` ({res.elapsed_sec:.1f}s)"
@@ -77,12 +80,12 @@ def format_report(
         extras = []
         if res.usage is not None:
             extras.append(res.usage.format_short())
-        if quota_str:
+        if quota_str and res.status != "skipped":
             extras.append(quota_str)
         suffix = f" · {' · '.join(extras)}" if extras else ""
         lines.append(f"- {icon} **{label}**: {state}{suffix}")
 
-        if res.detail:
+        if res.detail and res.status in ("degraded", "fail"):
             notes.append(f"- **{label}**: {res.detail}")
 
     if notes:

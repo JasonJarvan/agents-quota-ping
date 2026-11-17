@@ -37,6 +37,8 @@ _MODEL_OR_FLAG_PATTERNS = (
     r"unexpected argument",
     r"flag provided but not defined",
     r"unknown argument",
+    r"unknown feature",
+    r"invalid feature",
     r"error: invalid value .* for '--model'",
 )
 

@@ -1,16 +1,17 @@
-"""Main runner: CLI flags, cross-platform locking, jitter, log rotation, and orchestration."""
+"""Main runner: CLI flags, cross-platform locking, parallel execution, and notifications."""
 
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime
 import json
-import os
 from pathlib import Path
 import random
 import shlex
 import sys
+import threading
 import time
 from typing import Iterator
 
@@ -93,19 +94,21 @@ def read_codex_profile(cfg: AppConfig) -> str | None:
 
 
 def make_logger(log_path: Path, quiet_stdout: bool = False):
-    """Create a line logger writing timestamps to log_path and optionally stdout."""
+    """Create a thread-safe line logger writing timestamps to log_path and optionally stdout."""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     rotate_log_if_needed(log_path)
+    lock = threading.Lock()
 
     def log(msg: str) -> None:
         line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
-        if not quiet_stdout:
-            print(line, flush=True)
-        try:
-            with log_path.open("a", encoding="utf-8") as fh:
-                fh.write(line + "\n")
-        except OSError:
-            pass
+        with lock:
+            if not quiet_stdout:
+                print(line, flush=True)
+            try:
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            except OSError:
+                pass
 
     return log
 
@@ -148,6 +151,14 @@ def _serialize_results(results: list[PingResult], finished_at: datetime, codex_p
     }
 
 
+def _run_parallel_providers(selected: list[str], worker_fn) -> list[PingResult]:
+    if len(selected) <= 1:
+        return [worker_fn(name) for name in selected]
+    with ThreadPoolExecutor(max_workers=len(selected)) as pool:
+        futures = [pool.submit(worker_fn, name) for name in selected]
+        return [fut.result() for fut in futures]
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="quota-ping",
@@ -160,6 +171,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Comma-separated providers to run (claude,codex,agy)",
     )
     parser.add_argument("--status-only", action="store_true", help="Query real reset times & usage APIs without sending prompts")
+    parser.add_argument("--force", action="store_true", help="Bypass pre-flight checks and force sending pings")
+    parser.add_argument(
+        "--no-skip-active",
+        action="store_true",
+        help="Still ping when a 5h window is already active (only skips exhausted/cooldown)",
+    )
     parser.add_argument("--json", action="store_true", help="Print structured JSON summary to stdout")
     parser.add_argument("--no-jitter", action="store_true", help="Skip startup random sleep")
     parser.add_argument("--min-jitter", type=int, default=10, help="Min jitter seconds (default: 10)")
@@ -201,21 +218,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.status_only:
         finished_at = datetime.now()
-        results: list[PingResult] = []
-        for name in selected:
+
+        def probe_one(name: str) -> PingResult:
             snap: QuotaSnapshot = probe_quota(name, cfg)
             status = "fail" if snap.error and snap.reset_at is None else "ok"
-            results.append(
-                PingResult(
-                    provider=PROVIDER_DISPLAY[name],
-                    status=status,
-                    tier=0,
-                    model="status-only",
-                    elapsed_sec=0.0,
-                    detail=snap.error,
-                    quota=snap,
-                )
+            return PingResult(
+                provider=PROVIDER_DISPLAY[name],
+                status=status,
+                tier=0,
+                model="status-only",
+                elapsed_sec=0.0,
+                detail=snap.error,
+                quota=snap,
             )
+
+        results = _run_parallel_providers(selected, probe_one)
         if args.json:
             print(json.dumps(_serialize_results(results, finished_at, codex_profile), indent=2, ensure_ascii=False))
         else:
@@ -236,16 +253,18 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(jitter_sec)
 
         env = base_cron_env(cfg)
-        results = []
-        for name in selected:
-            res = run_single_provider(
+        results = _run_parallel_providers(
+            selected,
+            lambda name: run_single_provider(
                 name,
                 cfg,
                 env,
                 timeout_sec=args.timeout,
                 log_fn=log,
-            )
-            results.append(res)
+                preflight=not args.force,
+                skip_if_active=not args.no_skip_active,
+            ),
+        )
 
         finished_at = datetime.now()
         report = format_report(

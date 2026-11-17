@@ -59,6 +59,19 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("异常/降级详情", msg)
         self.assertIn("haiku retired", msg)
 
+    def test_format_skipped_does_not_trigger_error_section(self) -> None:
+        dt = datetime(2026, 11, 17, 12, 2, 18)
+        msg = format_report(
+            [
+                PingResult("Claude", "skipped", 0, "preflight-skip", 0.0, detail="5h 窗口已激活 (已用 40%，15:20:00 重置)"),
+                PingResult("Codex", "ok", 1, "gpt-6-luna", 2.0),
+            ],
+            finished_at=dt,
+        )
+        self.assertIn("✅", msg)
+        self.assertIn("⏭", msg)
+        self.assertNotIn("异常/降级详情", msg)
+
     def test_send_feishu_falls_back_from_bot_to_user_and_disables_proxy(self) -> None:
         calls: list[tuple[list[str], dict[str, str]]] = []
 

@@ -1,7 +1,8 @@
 # agents-quota-ping
 
-> **Align 5-hour rolling quota windows for Claude Code, OpenAI Codex, and Google Antigravity (`agy`) with your workday — using the cheapest models, minimal context, live API reset-time verification, and cross-platform notifications.**
+> **Align 5-hour rolling quota windows for Claude Code, OpenAI Codex, and Google Antigravity (`agy`) with your workday — using the cheapest models, minimal context, live API reset-time verification, parallel execution, and optional notifications.**
 
+[![CI](https://github.com/JasonJarvan/agents-quota-ping/actions/workflows/ci.yml/badge.svg)](https://github.com/JasonJarvan/agents-quota-ping/actions/workflows/ci.yml)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Dependencies: Zero](https://img.shields.io/badge/dependencies-stdlib%20only-brightgreen.svg)](#installation)
 [![Platforms: Linux | macOS | Windows](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#cross-platform-scheduling)
@@ -11,11 +12,11 @@
 
 ## Why `agents-quota-ping`?
 
-Subscription plans for **Claude Code**, **Codex**, and **Antigravity (`agy`)** typically meter usage on a **rolling 5-hour window** starting from your **first message**. If you start coding at 10:00 AM, your window resets at 15:00 — right in the middle of afternoon work — leaving morning hours unused.
+Subscription plans for **Claude Code**, **Codex**, and **Antigravity (`agy`)** meter usage on a **rolling 5-hour window** starting from your **first message**. If you start coding at 10:00 AM, your window resets at 15:00 — right in the middle of afternoon work — leaving morning hours unused.
 
 Sending a tiny scheduled ping before work aligns three clean windows across the day (for example **`07:00 → 12:02 → 17:04`**, covering `07:00–22:04`).
 
-However, running naive commands like `claude -p "OK"` or `codex exec "OK"` in a cron job has four hidden traps that this tool solves out of the box:
+Running naive commands like `claude -p "OK"` or `codex exec "OK"` in a cron job has four hidden traps that this tool solves out of the box:
 
 1. **Flagship default models & reasoning waste**: Your interactive defaults (e.g., Fable/Opus `xhigh`, `gpt-6.1-sol` `max`, `Gemini 4 Hydrogen XHigh`), MCP servers, hooks, plugins, and `AGENTS.md`/`CLAUDE.md` get loaded on every naive ping — costing **10×–80× more quota** than needed.
 2. **Midday window collision**: If a `07:00` ping triggers after a random 60s delay (`07:01`), a `12:00` ping with a 30s delay (`12:00:30`) lands *inside* the old morning window instead of opening the afternoon window. Progressive triggers (`07:00`, `12:02`, `17:04`) + short jitter prevent boundary collisions.
@@ -26,35 +27,41 @@ However, running naive commands like `claude -p "OK"` or `codex exec "OK"` in a 
 
 ## Key Features
 
-- **Cheapest Model + Isolated Context per CLI**
+- **Cheapest Model + Isolated Context per CLI** (per-invocation flags only — never modifies your global `settings.json` / `config.toml`)
   - **Claude Code**: `--model haiku --effort low --tools "" --strict-mcp-config --disable-slash-commands --safe-mode --setting-sources user --system-prompt "Reply OK only." --no-session-persistence --output-format json` (keeps OAuth intact, unlike `--bare`, while skipping plugins, hooks, MCP, and default system prompt).
-  - **Codex CLI**: `codex exec -m gpt-6-luna -c model_reasoning_effort="low" -c model_verbosity="low" --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox read-only --json -C <empty_dir>` (skips `config.toml` high-effort defaults, MCP, and hooks).
+  - **Codex CLI**: `codex exec -m gpt-6-luna -c model_reasoning_effort="low" -c model_verbosity="low" --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox read-only --disable apps --disable shell_tool --disable view_image --disable skill_search --disable computer_use --disable browser_use --disable sleep_tool --json -C <empty_dir>` (skips `config.toml` high-effort defaults, MCP, hooks, and non-essential built-in tool schemas — **44% smaller** than default `codex exec`).
   - **Antigravity (`agy`)**: `--model gemini-3.8-flash-low --effort low --disable-slash-commands --mode plan --settings '{"allowNonWorkspaceAccess":false,"statusLine":{"enabled":false},"title":{"enabled":false}}' --output-format json` in an empty directory (avoids workspace `AGENTS.md` injection; touches Pool 1 only).
+- **Pre-Flight Quota Check (0-Token Smart Skip)**
+  - Before invoking any LLM, probes the live quota APIs (~0.5s, 0 tokens):
+    - **Exhausted (`0%` remaining) or multi-day cooldown** → skips automatically (avoids wasted calls and prevents hitting Antigravity overage credits at 0%).
+    - **Active 5h window already running (`used > 0%`)** → skips automatically unless `--force` or `--no-skip-active` is passed (never skips when `used == 0%`, because unused windows only report a floating placeholder reset time until the first real message!).
 - **Live Reset-Time & Utilization API Probes (`--status-only` supported)**
   - **Claude**: `GET https://api.anthropic.com/api/oauth/usage` (`five_hour.resets_at`, `utilization`, `seven_day`)
   - **Codex**: `GET https://chatgpt.com/backend-api/codex/usage` (fallback `wham/usage`; `primary_window.reset_at`, `used_percent`, `secondary_window`)
   - **Antigravity**: `POST https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` (`quotaInfo.resetTime`, `remainingFraction` for Pool 1)
   - Gracefully falls back to estimated `+5h` if an API endpoint is temporarily unreachable.
-- **Exact Per-Ping Token Telemetry**
-  - Extracts real `input_tokens`, `cached_tokens`, `output_tokens`, and `total_cost_usd` directly from `--output-format json` / `--json`.
+- **Parallel Execution & Exact Token Telemetry**
+  - Runs all selected providers concurrently (`ThreadPoolExecutor`, finishing in ~15s instead of ~40s).
+  - Extracts real uncached `input_tokens`, `cached_tokens`, `output_tokens`, and `total_cost_usd` directly from JSON/JSONL outputs (server-side prompt prefix caching can still apply even on `--ephemeral` single-shot requests).
 - **Smart 3-Way Failure Handling (No Blind Escalation)**
   - **Transient network/timeout** → retries Tier 1 once; never escalates to expensive models.
   - **Auth expired / quota exhausted (`401`, `429`, `RESOURCE_EXHAUSTED`)** → stops immediately and alerts; never burns other pools.
-  - **Retired model / changed CLI flags** → dynamically selects the lightest available replacement from `~/.codex/models_cache.json` or `agy models` (Pool 1 only), or falls back safely while flagging `⚠ DEGRADED` in the notification.
+  - **Retired model / changed CLI flags** → dynamically selects the lightest available replacement from `~/.codex/models_cache.json` or `agy models` (Pool 1 only), or falls back safely while flagging `⚠ DEGRADED`.
 - **Cross-Platform & Zero Dependencies**
   - Pure Python 3.10+ standard library; runs on **Linux**, **macOS**, and **Windows** (`fcntl` / `msvcrt` file lock, `.cmd`/`.bat` shim handling, XDG / `%APPDATA%` paths, macOS Keychain fallback for Claude OAuth).
-- **Flexible Notifications**: Feishu (`lark-cli` DM or group chat) and/or any JSON Webhook (Feishu bot, Slack, Discord, custom endpoint).
+- **Optional Notifications**
+  - Notifications are **100% optional** — works standalone with stdout/log/`--json`, or notifies via generic **Webhook** (Slack, Discord, Feishu custom bot, etc.) or **Feishu (`lark-cli`)** DM/group chat.
 
 ---
 
 ## Measured Footprint per Ping
 
-Measured directly from a live run with `--no-jitter` (empty working directory):
+Measured directly from live runs on an empty working directory:
 
 | Provider | Model (Tier 1) | Measured Tokens | Quota Impact | Latency |
 |---|---|---|---|---|
 | **Claude Code** | `haiku` (`claude-haiku-5-5`) | **713 tok** (`709 in / 4 out`, `~$0.00001`) | Negligible | ~10s |
-| **Codex CLI** | `gpt-6-luna` | **29,006 tok** (`29,001 in / 5 out`, built-in tool schemas) | `0%` on 5h meter | ~15s |
+| **Codex CLI** | `gpt-6-luna` (non-essential tools disabled) | **16,147 tok** (`16,147 in / 5 out`, down 44% from `29,001`) | `0%` on 5h meter | ~11s |
 | **Antigravity** | `gemini-3.8-flash-low` | **11,235 tok** (`11,234 in / 1 out`) | ~1% Pool 1 Flash/Hydrogen | ~13s |
 
 ---
@@ -87,7 +94,7 @@ Make sure all three CLIs (`claude`, `codex`, `agy`) are already authenticated in
 
 ## Configuration (Optional)
 
-Copy [`config.example.json`](config.example.json) to your OS config path:
+By default `quota-ping` works out of the box with no config file (logs to OS state dir, stdout/JSON only). To add a proxy or optional notifications, copy [`config.example.json`](config.example.json) to your OS config path:
 
 - **Linux / macOS**: `~/.config/agents-quota-ping/config.json`
 - **Windows**: `%APPDATA%\agents-quota-ping\config.json`
@@ -112,14 +119,14 @@ Copy [`config.example.json`](config.example.json) to your OS config path:
   },
   "notify": {
     "lark_bin": "",
-    "feishu_user_id": "ou_your_open_id",
+    "feishu_user_id": "",
     "feishu_chat_id": "",
     "webhook_url": ""
   }
 }
 ```
 
-Environment variable overrides are also supported: `QUOTA_PING_CONFIG`, `QUOTA_PING_STATE_DIR`, `QUOTA_PING_HTTP_PROXY`, `QUOTA_PING_ALL_PROXY`, `QUOTA_PING_WEBHOOK_URL`, `QUOTA_PING_FEISHU_USER_ID`, `QUOTA_PING_FEISHU_CHAT_ID`, `QUOTA_PING_CLAUDE_BIN`, `QUOTA_PING_CODEX_BIN`, `QUOTA_PING_AGY_BIN`, `QUOTA_PING_LARK_BIN`.
+Environment variable overrides: `QUOTA_PING_CONFIG`, `QUOTA_PING_STATE_DIR`, `QUOTA_PING_HTTP_PROXY`, `QUOTA_PING_ALL_PROXY`, `QUOTA_PING_WEBHOOK_URL`, `QUOTA_PING_FEISHU_USER_ID`, `QUOTA_PING_FEISHU_CHAT_ID`, `QUOTA_PING_CLAUDE_BIN`, `QUOTA_PING_CODEX_BIN`, `QUOTA_PING_AGY_BIN`, `QUOTA_PING_LARK_BIN`.
 
 ---
 
@@ -133,22 +140,25 @@ quota-ping --dry-run
 quota-ping --status-only
 quota-ping --status-only --json
 
-# Run a real ping right now without startup jitter
+# Run a ping right now (smart-skips already-active/exhausted windows)
 quota-ping --no-jitter
+
+# Force pinging even if a 5h window is already active
+quota-ping --no-jitter --force
 
 # Ping only selected providers
 quota-ping --only claude,codex --no-jitter
 ```
 
-Example output / notification:
+Example report:
 
 ```markdown
-✅ **AI 5h 额度唤醒完成** (2026-11-17 07:00:42)
-触发耗时: jitter 14s · 完成 07:00:42
+✅ **AI 5h 额度唤醒完成** (2026-11-17 07:00:18)
+触发耗时: jitter 14s · 完成 07:00:18
 
 - ✓ **Claude**: Tier 1 `haiku` (10.1s) · 713 tok (in 709/out 4), ~$0.00001 · 实测重置 12:00:00 · 5h已用1% · 7d已用12%
-- ✓ **Codex**: Tier 1 `gpt-6-luna` (14.7s) · 29006 tok (in 29001/out 5) · 实测重置 12:00:38 · 5h已用0% · 7d已用43%
-- ✓ **Antigravity (Pool 1)**: Tier 1 `gemini-3.8-flash-low` (13.1s) · 11235 tok (in 11234/out 1) · 实测重置 12:00:40 · 5h已用1%
+- ✓ **Codex**: Tier 1 `gpt-6-luna` (11.2s) · 16152 tok (in 16147/out 5) · 实测重置 12:00:16 · 5h已用0% · 7d已用43%
+- ✓ **Antigravity (Pool 1)**: Tier 1 `gemini-3.8-flash-low` (13.1s) · 11235 tok (in 11234/out 1) · 实测重置 12:00:18 · 5h已用1%
 ```
 
 ---
