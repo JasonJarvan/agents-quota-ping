@@ -66,7 +66,12 @@ def make_logger(log_path: Path, quiet_stdout: bool = False):
         line = f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
         with lock:
             if not quiet_stdout:
-                print(line, flush=True)
+                try:
+                    print(line, flush=True)
+                except UnicodeEncodeError:
+                    enc = getattr(sys.stdout, "encoding", None) or "ascii"
+                    safe = line.encode(enc, errors="replace").decode(enc, errors="replace")
+                    print(safe, flush=True)
             try:
                 with log_path.open("a", encoding="utf-8") as fh:
                     fh.write(line + "\n")
