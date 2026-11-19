@@ -138,6 +138,31 @@ _AGY_POOL1_PREFERRED_KEYS = (
     "gemini-2.5-flash",
 )
 
+_AGY_POOL2_PREFERRED_KEYS = (
+    "gpt-oss-120b-medium",
+    "claude-sonnet-5-5-low",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-high",
+    "claude-opus-5-5-low",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-high",
+)
+
+
+def _snapshot_from_agy_quota_info(provider: str, chosen: dict) -> QuotaSnapshot:
+    reset_at = parse_iso_utc(chosen.get("resetTime"))
+    rem_frac = chosen.get("remainingFraction")
+    rem_pct = int(round(float(rem_frac) * 100)) if isinstance(rem_frac, (int, float)) else None
+    used_pct = max(0, 100 - rem_pct) if rem_pct is not None else None
+    return QuotaSnapshot(
+        provider=provider,
+        reset_at=reset_at,
+        window_label="5h",
+        used_percent=used_pct,
+        remaining_percent=rem_pct,
+        source="api",
+    )
+
 
 def parse_agy_models_payload(data: dict) -> QuotaSnapshot:
     """Parse Pool 1 (Flash/Hydrogen) quotaInfo from Antigravity fetchAvailableModels."""
@@ -165,19 +190,37 @@ def parse_agy_models_payload(data: dict) -> QuotaSnapshot:
     if chosen is None:
         return QuotaSnapshot(provider="Antigravity", source="api", error="Pool 1 quotaInfo missing")
 
-    reset_at = parse_iso_utc(chosen.get("resetTime"))
-    rem_frac = chosen.get("remainingFraction")
-    rem_pct = int(round(float(rem_frac) * 100)) if isinstance(rem_frac, (int, float)) else None
-    used_pct = max(0, 100 - rem_pct) if rem_pct is not None else None
+    return _snapshot_from_agy_quota_info("Antigravity", chosen)
 
-    return QuotaSnapshot(
-        provider="Antigravity",
-        reset_at=reset_at,
-        window_label="5h",
-        used_percent=used_pct,
-        remaining_percent=rem_pct,
-        source="api",
-    )
+
+def parse_agy_pool2_models_payload(data: dict) -> QuotaSnapshot:
+    """Parse Pool 2 (Claude/GPT-OSS) quotaInfo from Antigravity fetchAvailableModels."""
+    provider = "Antigravity (Claude/GPT)"
+    models = data.get("models") if isinstance(data.get("models"), dict) else {}
+    chosen: dict | None = None
+
+    for key in _AGY_POOL2_PREFERRED_KEYS:
+        candidate = models.get(key)
+        if isinstance(candidate, dict) and isinstance(candidate.get("quotaInfo"), dict):
+            if candidate["quotaInfo"].get("resetTime"):
+                chosen = candidate["quotaInfo"]
+                break
+
+    if chosen is None:
+        for key, candidate in models.items():
+            lower = str(key).lower()
+            if any(bad in lower for bad in ("gemini", "flash", "hydrogen", "argon", "neon", "carbon", "orchestrator")):
+                continue
+            if any(tok in lower for tok in ("claude", "gpt", "oss")) and isinstance(candidate, dict):
+                qi = candidate.get("quotaInfo")
+                if isinstance(qi, dict) and qi.get("resetTime"):
+                    chosen = qi
+                    break
+
+    if chosen is None:
+        return QuotaSnapshot(provider=provider, source="api", error="Pool 2 (Claude/GPT) quotaInfo missing")
+
+    return _snapshot_from_agy_quota_info(provider, chosen)
 
 
 def _open_url_json(
@@ -312,17 +355,16 @@ def probe_codex_quota(cfg: AppConfig) -> QuotaSnapshot:
         return QuotaSnapshot(provider="Codex", error=str(exc)[:120])
 
 
-def probe_agy_quota(cfg: AppConfig) -> QuotaSnapshot:
-    """Query Antigravity Cloud Code API for Pool 1 live resetTime and remainingFraction."""
+def _fetch_agy_models_payload(cfg: AppConfig) -> tuple[dict | None, str]:
     token_path = cfg.agy_data_dir / "antigravity-oauth-token"
     if not token_path.is_file():
-        return QuotaSnapshot(provider="Antigravity", error="missing antigravity-oauth-token")
+        return None, "missing antigravity-oauth-token"
     try:
         token_data = json.loads(token_path.read_text(encoding="utf-8"))
         token_obj = token_data.get("token") if isinstance(token_data.get("token"), dict) else {}
         access_token = token_obj.get("access_token")
         if not access_token:
-            return QuotaSnapshot(provider="Antigravity", error="missing access_token")
+            return None, "missing access_token"
 
         proj_file = cfg.agy_data_dir / "cache" / "default_project_id.txt"
         proj = proj_file.read_text(encoding="utf-8").strip() if proj_file.is_file() else ""
@@ -339,17 +381,35 @@ def probe_agy_quota(cfg: AppConfig) -> QuotaSnapshot:
             method="POST",
             body=payload,
         )
-        return parse_agy_models_payload(data)
+        return data, ""
     except Exception as exc:  # noqa: BLE001
-        return QuotaSnapshot(provider="Antigravity", error=str(exc)[:120])
+        return None, str(exc)[:120]
+
+
+def probe_agy_quota(cfg: AppConfig) -> QuotaSnapshot:
+    """Query Antigravity Cloud Code API for Pool 1 live resetTime and remainingFraction."""
+    data, err = _fetch_agy_models_payload(cfg)
+    if err or data is None:
+        return QuotaSnapshot(provider="Antigravity", error=err or "empty response")
+    return parse_agy_models_payload(data)
+
+
+def probe_agy_claude_quota(cfg: AppConfig) -> QuotaSnapshot:
+    """Query Antigravity Cloud Code API for Pool 2 (Claude/GPT) live resetTime and remainingFraction."""
+    data, err = _fetch_agy_models_payload(cfg)
+    if err or data is None:
+        return QuotaSnapshot(provider="Antigravity (Claude/GPT)", error=err or "empty response")
+    return parse_agy_pool2_models_payload(data)
 
 
 def probe_quota(provider_key: str, cfg: AppConfig) -> QuotaSnapshot:
-    """Probe live quota window API for `claude`, `codex`, or `agy`."""
+    """Probe live quota window API for `claude`, `codex`, `agy`, or `agy-claude`."""
     if provider_key == "claude":
         return probe_claude_quota(cfg)
     if provider_key == "codex":
         return probe_codex_quota(cfg)
     if provider_key == "agy":
         return probe_agy_quota(cfg)
+    if provider_key == "agy-claude":
+        return probe_agy_claude_quota(cfg)
     raise ValueError(f"Unknown provider key: {provider_key}")

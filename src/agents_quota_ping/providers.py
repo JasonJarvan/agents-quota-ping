@@ -17,6 +17,7 @@ from agents_quota_ping.classify import (
     classify_failure,
     extract_error_summary,
     pick_agy_pool1_models,
+    pick_agy_pool2_models,
     pick_codex_fallback_models,
 )
 from agents_quota_ping.config import AppConfig, claude_env, prepare_command_argv, proxy_env
@@ -258,17 +259,21 @@ def parse_agy_json_usage(stdout: str) -> TokenUsage | None:
             usage = stats.get("usage") if isinstance(stats.get("usage"), dict) else stats
     if not isinstance(usage, dict):
         return None
-    inp = usage.get("input_tokens") or usage.get("total_input_tokens") or 0
-    out = usage.get("output_tokens") or 0
-    cached = usage.get("cached_tokens") or 0
+    inp = int(usage.get("input_tokens") or usage.get("total_input_tokens") or 0)
+    out = int(usage.get("output_tokens") or 0)
+    cached = int(usage.get("cached_tokens") or usage.get("cache_read_tokens") or 0)
     total = usage.get("total_tokens")
     if not any((inp, out, cached, total)):
         return None
+    total_int = int(total) if isinstance(total, (int, float)) else None
+    fresh_inp = inp
+    if cached > 0 and inp >= cached and (total_int is None or total_int == inp + out):
+        fresh_inp = inp - cached
     return TokenUsage(
-        input_tokens=int(inp),
-        output_tokens=int(out),
-        cached_tokens=int(cached),
-        total_tokens=int(total) if isinstance(total, (int, float)) else None,
+        input_tokens=fresh_inp,
+        output_tokens=out,
+        cached_tokens=cached,
+        total_tokens=total_int,
     )
 
 
@@ -277,7 +282,7 @@ def _parse_usage_for(provider_key: str, stdout: str) -> TokenUsage | None:
         return parse_claude_json_usage(stdout)
     if provider_key == "codex":
         return parse_codex_jsonl_usage(stdout)
-    if provider_key == "agy":
+    if provider_key in ("agy", "agy-claude"):
         return parse_agy_json_usage(stdout)
     return None
 
@@ -506,9 +511,8 @@ def build_codex_tiers(cfg: AppConfig, workdir: Path) -> list[CommandTier]:
     return tiers
 
 
-def build_agy_tier1(cfg: AppConfig) -> CommandTier:
-    """Build Tier 1 command for Antigravity Pool 1 (Flash + Hydrogen)."""
-    minimal_settings = json.dumps(
+def _agy_minimal_settings_json() -> str:
+    return json.dumps(
         {
             "allowNonWorkspaceAccess": False,
             "statusLine": {"enabled": False},
@@ -516,6 +520,17 @@ def build_agy_tier1(cfg: AppConfig) -> CommandTier:
         },
         separators=(",", ":"),
     )
+
+
+def _agy_effort_args(model: str) -> list[str]:
+    lower = model.lower()
+    if lower.endswith(("-low", "-medium", "-high", "-xhigh")):
+        return []
+    return ["--effort", "low"]
+
+
+def build_agy_tier1(cfg: AppConfig) -> CommandTier:
+    """Build Tier 1 command for Antigravity Pool 1 (Flash + Hydrogen)."""
     return CommandTier(
         tier=1,
         model="gemini-3.8-flash-low",
@@ -529,13 +544,42 @@ def build_agy_tier1(cfg: AppConfig) -> CommandTier:
             "--mode",
             "plan",
             "--settings",
-            minimal_settings,
+            _agy_minimal_settings_json(),
             "--output-format",
             "json",
             "-p",
             "Reply OK only. Do not use any tools.",
         ],
         note="Pool 1 cheapest model (Flash shares quota with Hydrogen)",
+    )
+
+
+def build_agy_claude_tier1(cfg: AppConfig) -> CommandTier:
+    """Build Tier 1 command for Antigravity Pool 2 (Claude / GPT-OSS).
+
+    ``gpt-oss-120b-medium`` shares the Claude/GPT 5h quota pool at ~0.0025% per ping
+    (~400x cheaper than ``claude-sonnet-5-5-low``). Its slug already pins ``medium``
+    so ``--effort`` must be omitted. Once retired (scheduled 2026-11-30), Tier 2
+    automatically falls back to ``claude-sonnet-5-5-low``.
+    """
+    return CommandTier(
+        tier=1,
+        model="gpt-oss-120b-medium",
+        argv=[
+            cfg.agy_bin,
+            "--model",
+            "gpt-oss-120b-medium",
+            "--disable-slash-commands",
+            "--mode",
+            "plan",
+            "--settings",
+            _agy_minimal_settings_json(),
+            "--output-format",
+            "json",
+            "-p",
+            "Reply OK only. Do not use any tools.",
+        ],
+        note="Pool 2 cheapest model (GPT-OSS shares quota with Claude; falls back to claude-sonnet-5-5-low)",
     )
 
 
@@ -559,8 +603,7 @@ def discover_agy_fallbacks(
                         cfg.agy_bin,
                         "--model",
                         model,
-                        "--effort",
-                        "low",
+                        *_agy_effort_args(model),
                         "--disable-slash-commands",
                         "--output-format",
                         "json",
@@ -578,6 +621,50 @@ def discover_agy_fallbacks(
             note="last-resort default agy flags",
         )
     )
+    return tiers
+
+
+def discover_agy_claude_fallbacks(
+    cfg: AppConfig,
+    run_cmd: RunCmd,
+    workdir: Path,
+    env: dict[str, str],
+) -> list[CommandTier]:
+    """Query `agy models` dynamically to find Pool 2 (Claude/GPT) fallback models.
+
+    Never appends bare ``default`` (which would silently hit Gemini Pool 1).
+    """
+    rc, stdout, stderr, timed_out = run_cmd([cfg.agy_bin, "models"], env, workdir, 20)
+    models: list[str] = []
+    if rc == 0 and not timed_out:
+        models = pick_agy_pool2_models(stdout + "\n" + stderr, exclude={"gpt-oss-120b-medium"})
+    if not models:
+        models = ["claude-sonnet-5-5-low"]
+
+    tiers: list[CommandTier] = []
+    for model in models[:2]:
+        tiers.append(
+            CommandTier(
+                tier=2,
+                model=model,
+                argv=[
+                    cfg.agy_bin,
+                    "--model",
+                    model,
+                    *_agy_effort_args(model),
+                    "--disable-slash-commands",
+                    "--mode",
+                    "plan",
+                    "--settings",
+                    _agy_minimal_settings_json(),
+                    "--output-format",
+                    "json",
+                    "-p",
+                    "Reply OK only. Do not use any tools.",
+                ],
+                note=f"Pool 2 fallback from agy models ({model})",
+            )
+        )
     return tiers
 
 
@@ -704,6 +791,14 @@ def execute_with_fallback(
     )
 
 
+_PROVIDER_LABELS = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "agy": "Antigravity",
+    "agy-claude": "Antigravity (Claude/GPT)",
+}
+
+
 def run_single_provider(
     name: str,
     cfg: AppConfig,
@@ -723,10 +818,9 @@ def run_single_provider(
     never skips or blocks Codex or Antigravity. ``ok`` and ``degraded`` write
     ``last-ping-<provider>.json``; skips and hard failures do not.
     """
-    label_map = {"claude": "Claude", "codex": "Codex", "agy": "Antigravity"}
-    if name not in label_map:
+    if name not in _PROVIDER_LABELS:
         raise ValueError(f"Unknown provider: {name}")
-    provider_label = label_map[name]
+    provider_label = _PROVIDER_LABELS[name]
 
     with acquire_lock(cfg.state_dir / f"run-{name}.lock") as acquired:
         if not acquired:
@@ -774,10 +868,9 @@ def _run_single_provider_locked(
     skip_if_active: bool = True,
 ) -> PingResult:
     """Run pre-flight quota check, ping if needed, and measure post-ping reset time."""
-    label_map = {"claude": "Claude", "codex": "Codex", "agy": "Antigravity"}
-    if name not in label_map:
+    if name not in _PROVIDER_LABELS:
         raise ValueError(f"Unknown provider: {name}")
-    provider_label = label_map[name]
+    provider_label = _PROVIDER_LABELS[name]
 
     if preflight:
         pre_snap = quota_probe(name, cfg)
@@ -830,14 +923,30 @@ def _run_single_provider_locked(
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
-    else:
+    elif name == "agy":
         env = proxy_env(cfg, base_env)
         tier1 = build_agy_tier1(cfg)
         res = execute_with_fallback(
-            "Antigravity",
+            provider_label,
             "agy",
             tier1,
             lambda: discover_agy_fallbacks(cfg, run_cmd, cfg.empty_workdir, env),
+            env,
+            cfg.empty_workdir,
+            run_cmd=run_cmd,
+            timeout_sec=timeout_sec,
+            retry_delay_sec=retry_delay_sec,
+            sleep_fn=sleep_fn,
+            log_fn=log_fn,
+        )
+    else:
+        env = proxy_env(cfg, base_env)
+        tier1 = build_agy_claude_tier1(cfg)
+        res = execute_with_fallback(
+            provider_label,
+            "agy-claude",
+            tier1,
+            lambda: discover_agy_claude_fallbacks(cfg, run_cmd, cfg.empty_workdir, env),
             env,
             cfg.empty_workdir,
             run_cmd=run_cmd,

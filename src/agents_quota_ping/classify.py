@@ -213,3 +213,48 @@ def pick_agy_pool1_models(models_output: str, exclude: set[str] | None = None) -
             candidates.append(slug)
     candidates.sort(key=_agy_pool1_rank)
     return candidates
+
+
+def _agy_pool2_rank(slug: str) -> tuple[int, str]:
+    lower = slug.lower()
+    if "oss" in lower:
+        return (0, lower)
+    if "haiku" in lower:
+        return (1, lower)
+    if "sonnet" in lower:
+        if lower.endswith("-low"):
+            return (2, lower)
+        if lower.endswith("-medium"):
+            return (3, lower)
+        return (4, lower)
+    if "opus" in lower:
+        if lower.endswith("-low"):
+            return (5, lower)
+        if lower.endswith("-medium"):
+            return (6, lower)
+        return (7, lower)
+    return (8, lower)
+
+
+def pick_agy_pool2_models(models_output: str, exclude: set[str] | None = None) -> list[str]:
+    """Parse `agy models` output and return only Pool 2 (Claude/GPT-OSS) models, cheapest first."""
+    excluded = exclude or set()
+    cleaned = strip_ansi(models_output)
+    candidates: list[str] = []
+    for line in cleaned.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = re.match(r"^([a-z0-9][a-z0-9._-]+)\s+", line)
+        if not match:
+            continue
+        slug = match.group(1)
+        lower = slug.lower()
+        if slug in excluded:
+            continue
+        if any(bad in lower for bad in ("gemini", "flash", "hydrogen", "argon", "neon", "carbon", "orchestrator")):
+            continue
+        if any(tok in lower for tok in ("claude", "gpt", "oss")):
+            candidates.append(slug)
+    candidates.sort(key=_agy_pool2_rank)
+    return candidates

@@ -14,10 +14,11 @@ import threading
 import time
 
 from agents_quota_ping.config import AppConfig, base_cron_env, load_config
-from agents_quota_ping.notify import format_report, send_notifications
+from agents_quota_ping.notify import format_report, send_notifications, should_notify
 from agents_quota_ping.scheduler import attach_followup, concise_followup_note
 from agents_quota_ping.providers import (
     PingResult,
+    build_agy_claude_tier1,
     build_agy_tier1,
     build_claude_tiers,
     build_codex_tiers,
@@ -25,8 +26,13 @@ from agents_quota_ping.providers import (
 )
 from agents_quota_ping.quota import QuotaSnapshot, probe_quota
 
-ALL_PROVIDERS = ("claude", "codex", "agy")
-PROVIDER_DISPLAY = {"claude": "Claude", "codex": "Codex", "agy": "Antigravity"}
+ALL_PROVIDERS = ("claude", "codex", "agy", "agy-claude")
+PROVIDER_DISPLAY = {
+    "claude": "Claude",
+    "codex": "Codex",
+    "agy": "Antigravity",
+    "agy-claude": "Antigravity (Claude/GPT)",
+}
 MAX_LOG_BYTES = 1024 * 1024
 
 
@@ -128,7 +134,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--only",
         default=",".join(ALL_PROVIDERS),
-        help="Comma-separated providers to run (claude,codex,agy)",
+        help="Comma-separated providers to run (claude,codex,agy,agy-claude)",
     )
     parser.add_argument("--status-only", action="store_true", help="Query real reset times & usage APIs without sending prompts")
     parser.add_argument("--force", action="store_true", help="Bypass pre-flight checks and force sending pings")
@@ -186,6 +192,9 @@ def main(argv: list[str] | None = None) -> int:
             elif name == "agy":
                 t = build_agy_tier1(cfg)
                 print(f"[agy Tier {t.tier} ({t.model})] {shlex.join(t.argv)}")
+            elif name == "agy-claude":
+                t = build_agy_claude_tier1(cfg)
+                print(f"[agy-claude Tier {t.tier} ({t.model})] {shlex.join(t.argv)}")
         return 0
 
     if args.status_only:
@@ -260,6 +269,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(_serialize_results(results, finished_at, codex_profile), indent=2, ensure_ascii=False))
 
     if not args.no_notify:
-        send_notifications(report, cfg, base_env=env, log_fn=log)
+        if should_notify(results):
+            send_notifications(report, cfg, base_env=env, log_fn=log)
+        else:
+            log("ℹ 全部提供商均已跳过，本次不发送通知")
 
     return 1 if any(r.status == "fail" for r in results) else 0

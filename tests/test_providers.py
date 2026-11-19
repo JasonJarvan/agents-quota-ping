@@ -9,6 +9,8 @@ import unittest
 from agents_quota_ping.config import load_config
 from agents_quota_ping.providers import (
     CommandTier,
+    build_agy_claude_tier1,
+    discover_agy_claude_fallbacks,
     discover_agy_fallbacks,
     execute_with_fallback,
     parse_agy_json_usage,
@@ -199,3 +201,76 @@ class ProviderExecutionTests(unittest.TestCase):
         u = parse_agy_json_usage('{"stats":{"usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}')
         assert u is not None
         self.assertEqual(u.total(), 12)
+        u_cached = parse_agy_json_usage(
+            '{"usage":{"input_tokens":6828,"output_tokens":51,"cache_read_tokens":2944,"total_tokens":6879}}'
+        )
+        assert u_cached is not None
+        self.assertEqual(u_cached.input_tokens, 3884)
+        self.assertEqual(u_cached.cached_tokens, 2944)
+        self.assertEqual(u_cached.output_tokens, 51)
+        self.assertEqual(u_cached.total(), 6879)
+
+    def test_agy_claude_tier1_and_pool2_only_fallbacks(self) -> None:
+        t1 = build_agy_claude_tier1(self.cfg)
+        self.assertEqual(t1.model, "gpt-oss-120b-medium")
+        self.assertNotIn("--effort", t1.argv)
+
+        def fake_models_ok(_argv, _env, _cwd, _timeout):
+            return (
+                0,
+                "gemini-3.8-flash-low Flash\n"
+                "claude-opus-5-5-low Opus\n"
+                "claude-sonnet-5-5-medium SonnetMed\n"
+                "claude-sonnet-5-5-low SonnetLow\n"
+                "gpt-oss-120b-medium GPT\n",
+                "",
+                False,
+            )
+
+        tiers = discover_agy_claude_fallbacks(self.cfg, fake_models_ok, self.workdir, {})
+        self.assertEqual([t.model for t in tiers], ["claude-sonnet-5-5-low", "claude-sonnet-5-5-medium"])
+        for t in tiers:
+            self.assertNotIn("--effort", t.argv)
+            self.assertNotEqual(t.model, "default")
+
+        def fake_models_fail(_argv, _env, _cwd, _timeout):
+            return 1, "", "offline", False
+
+        static_tiers = discover_agy_claude_fallbacks(self.cfg, fake_models_fail, self.workdir, {})
+        self.assertEqual([t.model for t in static_tiers], ["claude-sonnet-5-5-low"])
+
+    def test_run_single_provider_agy_claude_falls_back_after_sunset(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(argv, _env, _cwd, _timeout):
+            calls.append(argv)
+            if argv[1:] == ["models"]:
+                return 0, "claude-sonnet-5-5-low Claude Sonnet 5.5 (Low)\n", "", False
+            if "gpt-oss-120b-medium" in argv:
+                return 1, "", "error: unknown model gpt-oss-120b-medium", False
+            return (
+                0,
+                '{"status":"SUCCESS","usage":{"input_tokens":100,"output_tokens":4,"cache_read_tokens":40,"total_tokens":104}}',
+                "",
+                False,
+            )
+
+        unused_snap = QuotaSnapshot(
+            "Antigravity (Claude/GPT)",
+            reset_at=datetime.now(timezone.utc) + timedelta(hours=5),
+            used_percent=0,
+            remaining_percent=100,
+        )
+        res = run_single_provider(
+            "agy-claude",
+            self.cfg,
+            {},
+            run_cmd=fake_run,
+            quota_probe=lambda _n, _c: unused_snap,
+            sleep_fn=lambda _s: None,
+        )
+        self.assertEqual(res.provider, "Antigravity (Claude/GPT)")
+        self.assertEqual(res.status, "degraded")
+        self.assertEqual(res.tier, 2)
+        self.assertEqual(res.model, "claude-sonnet-5-5-low")
+        self.assertEqual(len(calls), 3)

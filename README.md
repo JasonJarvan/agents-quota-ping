@@ -20,7 +20,7 @@ Running naive commands like `claude -p "OK"` or `codex exec "OK"` in a cron job 
 
 1. **Flagship default models & reasoning waste**: Your interactive defaults (e.g., Fable/Opus `xhigh`, `gpt-6.1-sol` `max`, `Gemini 4 Hydrogen XHigh`), MCP servers, hooks, plugins, and `AGENTS.md`/`CLAUDE.md` get loaded on every naive ping — costing **10×–80× more quota** than needed.
 2. **Midday window collision**: If a `07:00` ping triggers after a random 60s delay (`07:01`), a `12:00` ping with a 30s delay (`12:00:30`) lands *inside* the old morning window instead of opening the afternoon window. Progressive triggers (`07:00`, `12:02`, `17:04`) + short jitter prevent boundary collisions.
-3. **Antigravity separate quota buckets**: `agy` separates `Gemini Flash + Hydrogen` (Pool 1), `Argon` (Pool 2), and `Claude/GPT-OSS` (Pool 3). Pinging `gemini-3.8-flash-low` warms Pool 1 at Flash cost without burning Argon or third-party pools.
+3. **Antigravity separate quota buckets**: `agy` separates its **Gemini pool** (`Flash` / `Hydrogen` / `Pro`) from its **Claude / GPT-OSS pool** (`gpt-oss-120b-medium`, `claude-sonnet-5-5-*`, `claude-opus-5-5-*`), with independent 5-hour reset timers. `quota-ping` warms **both** pools independently (`agy` via `gemini-3.8-flash-low` and `agy-claude` via `gpt-oss-120b-medium`, auto-falling back to `claude-sonnet-5-5-low` once `gpt-oss-120b-medium` sunsets).
 4. **Silent auth/model breakage in headless cron**: Non-interactive schedulers lack `nvm`/Homebrew `PATH` and proxy variables, and models eventually retire.
 
 ---
@@ -30,7 +30,8 @@ Running naive commands like `claude -p "OK"` or `codex exec "OK"` in a cron job 
 - **Cheapest Model + Isolated Context per CLI** (per-invocation flags only — never modifies your global `settings.json` / `config.toml`)
   - **Claude Code**: `--model haiku --effort low --tools "" --strict-mcp-config --disable-slash-commands --safe-mode --setting-sources user --system-prompt "Reply OK only." --no-session-persistence --output-format json` (keeps OAuth intact, unlike `--bare`, while skipping plugins, hooks, MCP, and default system prompt).
   - **Codex CLI**: `codex exec -m gpt-6-luna -c model_reasoning_effort="low" -c model_verbosity="low" --ephemeral --ignore-user-config --ignore-rules --skip-git-repo-check --sandbox read-only --disable apps --disable shell_tool --disable view_image --disable skill_search --disable computer_use --disable browser_use --disable sleep_tool --json -C <empty_dir>` (skips `config.toml` high-effort defaults, MCP, hooks, and non-essential built-in tool schemas — **44% smaller** than default `codex exec`).
-  - **Antigravity (`agy`)**: `--model gemini-3.8-flash-low --effort low --disable-slash-commands --mode plan --settings '{"allowNonWorkspaceAccess":false,"statusLine":{"enabled":false},"title":{"enabled":false}}' --output-format json` in an empty directory (avoids workspace `AGENTS.md` injection; touches Pool 1 only).
+  - **Antigravity (`agy` — Pool 1 Gemini)**: `--model gemini-3.8-flash-low --effort low --disable-slash-commands --mode plan --settings '{"allowNonWorkspaceAccess":false,"statusLine":{"enabled":false},"title":{"enabled":false}}' --output-format json` in an empty directory (avoids workspace `AGENTS.md` injection; touches Pool 1 only).
+  - **Antigravity (`agy-claude` — Pool 2 Claude/GPT-OSS)**: `--model gpt-oss-120b-medium --disable-slash-commands --mode plan --settings ... --output-format json` (~0.0025% quota per ping, ~400× cheaper than `claude-sonnet-5-5-low`). Automatically discovers Pool 2 fallbacks (`claude-sonnet-5-5-low` first, never Pool 1) once `gpt-oss-120b-medium` retires.
 - **Pre-Flight Quota Check (0-Token Smart Skip)**
   - Before invoking any LLM, probes the live quota APIs (~0.5s, 0 tokens):
     - **Exhausted (`0%` remaining) or multi-day cooldown** → skips automatically (avoids wasted calls and prevents hitting Antigravity overage credits at 0%).
@@ -49,8 +50,9 @@ Running naive commands like `claude -p "OK"` or `codex exec "OK"` in a cron job 
   - **Retired model / changed CLI flags** → dynamically selects the lightest available replacement from `~/.codex/models_cache.json` or `agy models` (Pool 1 only), or falls back safely while flagging `⚠ DEGRADED`.
 - **Cross-Platform & Zero Dependencies**
   - Pure Python 3.10+ standard library; runs on **Linux**, **macOS**, and **Windows** (`fcntl` / `msvcrt` file lock, `.cmd`/`.bat` shim handling, XDG / `%APPDATA%` paths, macOS Keychain fallback for Claude OAuth).
-- **Optional Notifications**
+- **Optional Notifications (Quiet on All-Skipped)**
   - Notifications are **100% optional** — works standalone with stdout/log/`--json`, or notifies via generic **Webhook** (Slack, Discord, Feishu custom bot, etc.) or **Feishu (`lark-cli`)** DM/group chat.
+  - When **every** provider in a run is skipped (all windows already active, exhausted, or in cooldown), remote notifications are suppressed automatically (follow-up timers still register and log locally).
 - **Independent OS follow-up**
   - After a run, registers a per-provider one-shot at `reset_at` plus 15–45 seconds when that reset is within 5.5 hours and still before the local cutoff (default 18:30). Linux uses `systemd-run --user`, macOS `launchd`, Windows Task Scheduler. The process does not sleep until the reset. `--no-followup` disables it.
 
@@ -64,7 +66,8 @@ Measured directly from live runs on an empty working directory:
 |---|---|---|---|---|
 | **Claude Code** | `haiku` (`claude-haiku-5-5`) | **713 tok** (`709 in / 4 out`, `~$0.00001`) | Negligible | ~10s |
 | **Codex CLI** | `gpt-6-luna` (non-essential tools disabled) | **16,147 tok** (`16,147 in / 5 out`, down 44% from `29,001`) | `0%` on 5h meter | ~11s |
-| **Antigravity** | `gemini-3.8-flash-low` | **11,235 tok** (`11,234 in / 1 out`) | ~1% Pool 1 Flash/Hydrogen | ~13s |
+| **Antigravity (Pool 1)** | `gemini-3.8-flash-low` | **11,235 tok** (`11,234 in / 1 out`) | ~1% Pool 1 Flash/Hydrogen | ~13s |
+| **Antigravity (Claude/GPT)** | `gpt-oss-120b-medium` (fallback `claude-sonnet-5-5-low`) | **6,879 tok** (`3,884 in + 2,944 cache / 51 out`) | **0.0025%** Pool 2 (~400× cheaper than Sonnet 5.5 Low at 1.01%) | ~13s |
 
 ---
 

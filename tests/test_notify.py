@@ -6,9 +6,10 @@ import tempfile
 import unittest
 
 from agents_quota_ping.config import load_config
-from agents_quota_ping.notify import format_report, send_notifications
+from agents_quota_ping.notify import format_report, send_notifications, should_notify
 from agents_quota_ping.providers import PingResult, TokenUsage
 from agents_quota_ping.quota import QuotaSnapshot
+from agents_quota_ping import runner
 
 
 class NotifyTests(unittest.TestCase):
@@ -135,3 +136,66 @@ class NotifyTests(unittest.TestCase):
         ok = send_notifications("hi", cfg, webhook_fn=fake_webhook)
         self.assertTrue(ok)
         self.assertEqual(seen, [("https://example.invalid/hook", "hi")])
+
+    def test_should_notify_suppresses_all_skipped_runs(self) -> None:
+        self.assertFalse(should_notify([]))
+        self.assertFalse(
+            should_notify(
+                [
+                    PingResult("Claude", "skipped", 0, "preflight-skip", 0.0, detail="active"),
+                    PingResult("Antigravity (Claude/GPT)", "skipped", 0, "preflight-skip", 0.0, detail="active"),
+                ]
+            )
+        )
+        self.assertTrue(
+            should_notify(
+                [
+                    PingResult("Claude", "skipped", 0, "preflight-skip", 0.0, detail="active"),
+                    PingResult("Antigravity (Claude/GPT)", "ok", 1, "gpt-oss-120b-medium", 2.0),
+                ]
+            )
+        )
+        self.assertTrue(should_notify([PingResult("Claude", "fail", 1, "haiku", 1.0, detail="401")]))
+
+    def test_runner_skips_notifications_when_all_providers_skipped(self) -> None:
+        from unittest.mock import patch
+
+        sent: list[str] = []
+
+        def fake_run_single(name, *_args, **_kwargs):
+            return PingResult(runner.PROVIDER_DISPLAY[name], "skipped", 0, "preflight-skip", 0.0, detail="active")
+
+        def fake_send(msg, *_args, **_kwargs):
+            sent.append(msg)
+            return True
+
+        with (
+            patch.object(runner, "load_config", return_value=self.cfg),
+            patch.object(runner, "run_single_provider", side_effect=fake_run_single),
+            patch.object(runner, "attach_followup", side_effect=lambda _n, r, *_a, **_k: r),
+            patch.object(runner, "send_notifications", side_effect=fake_send),
+        ):
+            rc = runner.main(["--only", "claude,agy-claude", "--no-jitter"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sent, [])
+
+        with (
+            patch.object(runner, "load_config", return_value=self.cfg),
+            patch.object(
+                runner,
+                "run_single_provider",
+                side_effect=lambda name, *_a, **_k: PingResult(
+                    runner.PROVIDER_DISPLAY[name],
+                    "ok" if name == "agy-claude" else "skipped",
+                    1 if name == "agy-claude" else 0,
+                    "gpt-oss-120b-medium" if name == "agy-claude" else "preflight-skip",
+                    1.0 if name == "agy-claude" else 0.0,
+                ),
+            ),
+            patch.object(runner, "attach_followup", side_effect=lambda _n, r, *_a, **_k: r),
+            patch.object(runner, "send_notifications", side_effect=fake_send),
+        ):
+            rc = runner.main(["--only", "claude,agy-claude", "--no-jitter"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("Antigravity (Claude/GPT)", sent[0])

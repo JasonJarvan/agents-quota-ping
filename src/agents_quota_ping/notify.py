@@ -15,6 +15,11 @@ from agents_quota_ping.providers import PingResult
 from agents_quota_ping.scheduler import concise_followup_note
 
 
+def should_notify(results: list[PingResult]) -> bool:
+    """Return False when every provider in the run was skipped (or nothing ran)."""
+    return bool(results) and not all(r.status == "skipped" for r in results)
+
+
 def _format_reset_fallback(finished_at: datetime) -> str:
     est = finished_at + timedelta(hours=5)
     return f"预计重置 ~{est:%H:%M}"

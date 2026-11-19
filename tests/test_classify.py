@@ -10,6 +10,7 @@ from agents_quota_ping.classify import (
     classify_failure,
     extract_error_summary,
     pick_agy_pool1_models,
+    pick_agy_pool2_models,
     pick_codex_fallback_models,
 )
 
@@ -70,3 +71,21 @@ class ClassifyTests(unittest.TestCase):
         )
         picked = pick_agy_pool1_models(raw, exclude={"gemini-3.8-flash-low"})
         self.assertEqual(picked, ["gemini-3.8-flash-medium", "gemini-4-hydrogen-low"])
+
+    def test_pick_agy_pool2_models_ranks_cheapest_and_excludes_gemini(self) -> None:
+        raw = (
+            "gemini-4-neon-low               Gemini 4 Neon (Low)\n"
+            "gemini-3.8-flash-low            Gemini 3.8 Flash (Low)\n"
+            "claude-opus-5-5-low             Claude Opus 5.5 (Low)\n"
+            "claude-sonnet-5-5-medium        Claude Sonnet 5.5 (Medium)\n"
+            "claude-sonnet-5-5-low           Claude Sonnet 5.5 (Low)\n"
+            "gpt-oss-120b-medium             GPT-OSS 120B (Medium)\n"
+        )
+        self.assertEqual(
+            pick_agy_pool2_models(raw),
+            ["gpt-oss-120b-medium", "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-opus-5-5-low"],
+        )
+        self.assertEqual(
+            pick_agy_pool2_models(raw, exclude={"gpt-oss-120b-medium"}),
+            ["claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-opus-5-5-low"],
+        )
