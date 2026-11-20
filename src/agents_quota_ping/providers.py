@@ -681,11 +681,12 @@ def execute_with_fallback(
     workdir: Path,
     run_cmd: RunCmd = default_run_cmd,
     timeout_sec: int = 90,
-    retry_delay_sec: float = 8.0,
+    retry_delay_sec: float = 10.0,
+    max_retries: int = 3,
     sleep_fn: Callable[[float], None] = time.sleep,
     log_fn: Callable[[str], None] = lambda _msg: None,
 ) -> PingResult:
-    """Run Tier 1, retry once if transient/unknown, and fall back only when safe."""
+    """Run Tier 1 with exponential backoff on transient failures, and fall back only when safe."""
     started = time.monotonic()
 
     log_fn(f"→ {provider_label} [Tier 1: {tier1.model}]")
@@ -720,15 +721,17 @@ def execute_with_fallback(
             detail=f"{kind.value}: {first_summary}",
         )
 
-    if kind in (ErrorKind.TRANSIENT, ErrorKind.UNKNOWN):
-        log_fn(f"↻ {provider_label} retrying Tier 1 after {retry_delay_sec:.0f}s...")
-        sleep_fn(retry_delay_sec)
+    retry_budget = max(0, max_retries) if kind == ErrorKind.TRANSIENT else (1 if kind == ErrorKind.UNKNOWN and max_retries > 0 else 0)
+    for attempt in range(retry_budget):
+        delay = retry_delay_sec * (2**attempt)
+        log_fn(f"↻ {provider_label} retrying Tier 1 ({attempt + 1}/{retry_budget}) after {delay:.0f}s...")
+        sleep_fn(delay)
         rc, stdout, stderr, timed_out = run_cmd(tier1.argv, env, workdir, timeout_sec)
         if rc == 0:
             elapsed = time.monotonic() - started
             usage = _parse_usage_for(provider_key, stdout)
             tok_note = f" [{usage.format_short()}]" if usage else ""
-            log_fn(f"✓ {provider_label} OK on retry [Tier 1: {tier1.model}] ({elapsed:.1f}s){tok_note}")
+            log_fn(f"✓ {provider_label} OK on retry {attempt + 1} [Tier 1: {tier1.model}] ({elapsed:.1f}s){tok_note}")
             return PingResult(
                 provider=provider_label,
                 status="ok",
@@ -741,8 +744,8 @@ def execute_with_fallback(
         combined = _combined_output(stdout, stderr)
         kind = classify_failure(rc, combined, timed_out=timed_out)
         first_summary = extract_error_summary(combined)
-        log_fn(f"✗ {provider_label} Tier 1 retry failed ({kind.value}): {first_summary}")
-        if kind in (ErrorKind.AUTH_OR_QUOTA, ErrorKind.TRANSIENT):
+        log_fn(f"✗ {provider_label} Tier 1 retry {attempt + 1} failed ({kind.value}): {first_summary}")
+        if kind == ErrorKind.AUTH_OR_QUOTA:
             elapsed = time.monotonic() - started
             return PingResult(
                 provider=provider_label,
@@ -752,6 +755,21 @@ def execute_with_fallback(
                 elapsed_sec=elapsed,
                 detail=f"{kind.value}: {first_summary}",
             )
+        if kind == ErrorKind.MODEL_OR_FLAG:
+            break
+        if kind != ErrorKind.TRANSIENT:
+            break
+
+    if kind == ErrorKind.TRANSIENT:
+        elapsed = time.monotonic() - started
+        return PingResult(
+            provider=provider_label,
+            status="fail",
+            tier=1,
+            model=tier1.model,
+            elapsed_sec=elapsed,
+            detail=f"{kind.value}: {first_summary}",
+        )
 
     last_detail = first_summary
     for candidate in fallback_loader():
@@ -776,7 +794,7 @@ def execute_with_fallback(
         fb_kind = classify_failure(rc, fb_combined, timed_out=fb_timed_out)
         last_detail = extract_error_summary(fb_combined)
         log_fn(f"✗ {provider_label} Tier {candidate.tier} ({candidate.model}) failed ({fb_kind.value}): {last_detail}")
-        if fb_kind == ErrorKind.AUTH_OR_QUOTA:
+        if fb_kind in (ErrorKind.AUTH_OR_QUOTA, ErrorKind.TRANSIENT):
             last_detail = f"{fb_kind.value}: {last_detail}"
             break
 
@@ -789,6 +807,41 @@ def execute_with_fallback(
         elapsed_sec=elapsed,
         detail=f"Tier 1({first_summary}); 兜底亦失败({last_detail})",
     )
+
+
+def _is_retryable_probe_error(snap: QuotaSnapshot) -> bool:
+    if not snap.error or snap.reset_at is not None or snap.remaining_percent is not None:
+        return False
+    lower = snap.error.lower()
+    if lower.startswith("missing ") or "no oauth credentials" in lower:
+        return False
+    return True
+
+
+def _probe_quota_with_retry(
+    name: str,
+    provider_label: str,
+    cfg: AppConfig,
+    quota_probe: Callable[[str, AppConfig], QuotaSnapshot],
+    *,
+    max_retries: int = 3,
+    base_delay_sec: float = 5.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    log_fn: Callable[[str], None] = lambda _msg: None,
+) -> QuotaSnapshot:
+    """Retry transient pre-flight quota API failures with exponential backoff."""
+    snap = quota_probe(name, cfg)
+    if not _is_retryable_probe_error(snap):
+        return snap
+    for attempt in range(max(0, max_retries)):
+        delay = base_delay_sec * (2**attempt)
+        log_fn(f"  ↻ {provider_label} pre-flight quota probe failed ({snap.error}), retrying ({attempt + 1}/{max_retries}) in {delay:.0f}s...")
+        sleep_fn(delay)
+        snap = quota_probe(name, cfg)
+        if not _is_retryable_probe_error(snap):
+            return snap
+    log_fn(f"  ℹ {provider_label} pre-flight quota probe unavailable after retries: {snap.error}")
+    return snap
 
 
 _PROVIDER_LABELS = {
@@ -806,7 +859,8 @@ def run_single_provider(
     run_cmd: RunCmd = default_run_cmd,
     quota_probe: Callable[[str, AppConfig], QuotaSnapshot] = probe_quota,
     timeout_sec: int = 90,
-    retry_delay_sec: float = 8.0,
+    retry_delay_sec: float = 10.0,
+    max_retries: int = 3,
     sleep_fn: Callable[[float], None] = time.sleep,
     log_fn: Callable[[str], None] = lambda _msg: None,
     preflight: bool = True,
@@ -841,6 +895,7 @@ def run_single_provider(
             quota_probe=quota_probe,
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
+            max_retries=max_retries,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
             preflight=preflight,
@@ -861,7 +916,8 @@ def _run_single_provider_locked(
     run_cmd: RunCmd = default_run_cmd,
     quota_probe: Callable[[str, AppConfig], QuotaSnapshot] = probe_quota,
     timeout_sec: int = 90,
-    retry_delay_sec: float = 8.0,
+    retry_delay_sec: float = 10.0,
+    max_retries: int = 3,
     sleep_fn: Callable[[float], None] = time.sleep,
     log_fn: Callable[[str], None] = lambda _msg: None,
     preflight: bool = True,
@@ -873,7 +929,16 @@ def _run_single_provider_locked(
     provider_label = _PROVIDER_LABELS[name]
 
     if preflight:
-        pre_snap = quota_probe(name, cfg)
+        pre_snap = _probe_quota_with_retry(
+            name,
+            provider_label,
+            cfg,
+            quota_probe,
+            max_retries=max_retries,
+            base_delay_sec=max(1.0, retry_delay_sec / 2.0),
+            sleep_fn=sleep_fn,
+            log_fn=log_fn,
+        )
         skip_reason = should_skip_preflight(
             pre_snap,
             skip_if_active=skip_if_active,
@@ -904,6 +969,7 @@ def _run_single_provider_locked(
             run_cmd=run_cmd,
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
+            max_retries=max_retries,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
@@ -920,6 +986,7 @@ def _run_single_provider_locked(
             run_cmd=run_cmd,
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
+            max_retries=max_retries,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
@@ -936,6 +1003,7 @@ def _run_single_provider_locked(
             run_cmd=run_cmd,
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
+            max_retries=max_retries,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
@@ -952,6 +1020,7 @@ def _run_single_provider_locked(
             run_cmd=run_cmd,
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
+            max_retries=max_retries,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )

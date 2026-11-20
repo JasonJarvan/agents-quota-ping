@@ -274,3 +274,104 @@ class ProviderExecutionTests(unittest.TestCase):
         self.assertEqual(res.tier, 2)
         self.assertEqual(res.model, "claude-sonnet-5-5-low")
         self.assertEqual(len(calls), 3)
+
+    def test_transient_uses_exponential_backoff_up_to_3_retries_without_escalating(self) -> None:
+        calls: list[list[str]] = []
+        sleeps: list[float] = []
+
+        def always_transient(argv, _env, _cwd, _timeout):
+            calls.append(argv)
+            return 1, "", '{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}', False
+
+        t1 = CommandTier(1, "gpt-6-luna", ["codex", "-m", "gpt-6-luna"])
+        fallback_called = False
+
+        def load_fallbacks():
+            nonlocal fallback_called
+            fallback_called = True
+            return [CommandTier(2, "gpt-6.2-sol", ["codex", "-m", "gpt-6.2-sol"])]
+
+        res = execute_with_fallback(
+            "Codex",
+            "codex",
+            t1,
+            load_fallbacks,
+            {},
+            self.workdir,
+            run_cmd=always_transient,
+            retry_delay_sec=10.0,
+            max_retries=3,
+            sleep_fn=sleeps.append,
+        )
+        self.assertEqual(res.status, "fail")
+        self.assertEqual(res.model, "gpt-6-luna")
+        self.assertFalse(fallback_called)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0])
+
+    def test_transient_recovers_on_third_exponential_retry(self) -> None:
+        calls: list[list[str]] = []
+        sleeps: list[float] = []
+
+        def recover_on_4th(argv, _env, _cwd, _timeout):
+            calls.append(argv)
+            if len(calls) < 4:
+                return 78, "", "AI trace request failed\nnetwork check failed", False
+            return 0, '{"type":"result","usage":{"input_tokens":10,"output_tokens":2}}', "", False
+
+        t1 = CommandTier(1, "haiku", ["claude", "--model", "haiku"])
+        res = execute_with_fallback(
+            "Claude",
+            "claude",
+            t1,
+            lambda: [CommandTier(2, "sonnet", ["claude", "--model", "sonnet"])],
+            {},
+            self.workdir,
+            run_cmd=recover_on_4th,
+            retry_delay_sec=10.0,
+            max_retries=3,
+            sleep_fn=sleeps.append,
+        )
+        self.assertEqual(res.status, "ok")
+        self.assertEqual(res.tier, 1)
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0])
+
+    def test_preflight_quota_probe_retries_exponentially_and_skips_cooldown(self) -> None:
+        probe_calls = 0
+        sleeps: list[float] = []
+        cli_called = False
+
+        def flaky_probe(_name, _cfg):
+            nonlocal probe_calls
+            probe_calls += 1
+            if probe_calls < 3:
+                return QuotaSnapshot("Codex", error="connection refused")
+            return QuotaSnapshot(
+                "Codex",
+                reset_at=datetime.now(timezone.utc) + timedelta(hours=7),
+                window_label="7d",
+                used_percent=97,
+                remaining_percent=3,
+            )
+
+        def fake_run(_argv, _env, _cwd, _timeout):
+            nonlocal cli_called
+            cli_called = True
+            return 0, "", "", False
+
+        res = run_single_provider(
+            "codex",
+            self.cfg,
+            {},
+            run_cmd=fake_run,
+            quota_probe=flaky_probe,
+            retry_delay_sec=10.0,
+            max_retries=3,
+            sleep_fn=sleeps.append,
+        )
+        self.assertEqual(probe_calls, 3)
+        self.assertEqual(sleeps, [5.0, 10.0])
+        self.assertFalse(cli_called)
+        self.assertEqual(res.status, "skipped")
+        self.assertIn("长周期冷却", res.detail)

@@ -45,7 +45,7 @@ Running naive commands like `claude -p "OK"` or `codex exec "OK"` in a cron job 
   - Runs all selected providers concurrently (`ThreadPoolExecutor`, finishing in ~15s instead of ~40s).
   - Extracts real uncached `input_tokens`, `cached_tokens`, `output_tokens`, and `total_cost_usd` directly from JSON/JSONL outputs (server-side prompt prefix caching can still apply even on `--ephemeral` single-shot requests).
 - **Smart 3-Way Failure Handling (No Blind Escalation)**
-  - **Transient network/timeout** → retries Tier 1 once; never escalates to expensive models.
+  - **Transient network/timeout** → retries pre-flight quota probes (`5s → 10s → 20s`) and Tier 1 pings (`10s → 20s → 40s`, up to 3 retries) with exponential backoff; never escalates to expensive models and never bypasses configured proxies/guards.
   - **Auth expired / quota exhausted (`401`, `429`, `RESOURCE_EXHAUSTED`)** → stops immediately and alerts; never burns other pools.
   - **Retired model / changed CLI flags** → dynamically selects the lightest available replacement from `~/.codex/models_cache.json` or `agy models` (Pool 1 only), or falls back safely while flagging `⚠ DEGRADED`.
 - **Cross-Platform & Zero Dependencies**

@@ -21,6 +21,11 @@ class ClassifyTests(unittest.TestCase):
 
     def test_network_502_is_transient(self) -> None:
         self.assertEqual(classify_failure(1, "HTTP 502 Bad Gateway"), ErrorKind.TRANSIENT)
+        self.assertEqual(classify_failure(78, "AI trace request failed\nnetwork check failed"), ErrorKind.TRANSIENT)
+        self.assertEqual(
+            classify_failure(1, '{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}'),
+            ErrorKind.TRANSIENT,
+        )
 
     def test_auth_and_quota_are_hard_stop(self) -> None:
         self.assertEqual(classify_failure(1, "401 Unauthorized: invalid_jwt"), ErrorKind.AUTH_OR_QUOTA)
