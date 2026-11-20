@@ -275,7 +275,7 @@ class ProviderExecutionTests(unittest.TestCase):
         self.assertEqual(res.model, "claude-sonnet-5-5-low")
         self.assertEqual(len(calls), 3)
 
-    def test_transient_uses_exponential_backoff_up_to_3_retries_without_escalating(self) -> None:
+    def test_transient_uses_10min_exponential_backoff_window_without_escalating(self) -> None:
         calls: list[list[str]] = []
         sleeps: list[float] = []
 
@@ -299,17 +299,47 @@ class ProviderExecutionTests(unittest.TestCase):
             {},
             self.workdir,
             run_cmd=always_transient,
-            retry_delay_sec=10.0,
-            max_retries=3,
             sleep_fn=sleeps.append,
         )
         self.assertEqual(res.status, "fail")
         self.assertEqual(res.model, "gpt-6-luna")
         self.assertFalse(fallback_called)
-        self.assertEqual(len(calls), 4)
-        self.assertEqual(sleeps, [10.0, 20.0, 40.0])
+        self.assertEqual(len(calls), 7)
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 80.0, 160.0, 290.0])
+        self.assertEqual(sum(sleeps), 600.0)
 
-    def test_transient_recovers_on_third_exponential_retry(self) -> None:
+    def test_transient_clamps_last_retry_to_10min_wall_clock_with_slow_failures(self) -> None:
+        clock = [0.0]
+        call_times: list[float] = []
+        sleeps: list[float] = []
+
+        def slow_fail(_argv, _env, _cwd, _timeout):
+            call_times.append(clock[0])
+            clock[0] += 20.0
+            return 1, "", '{"type":"turn.failed","error":{"message":"workspace routing discovery failed"}}', False
+
+        def fake_sleep(sec: float) -> None:
+            sleeps.append(sec)
+            clock[0] += sec
+
+        t1 = CommandTier(1, "gpt-6-luna", ["codex", "-m", "gpt-6-luna"])
+        res = execute_with_fallback(
+            "Codex",
+            "codex",
+            t1,
+            lambda: [],
+            {},
+            self.workdir,
+            run_cmd=slow_fail,
+            sleep_fn=fake_sleep,
+            monotonic_fn=lambda: clock[0],
+        )
+        self.assertEqual(res.status, "fail")
+        self.assertEqual(sleeps, [10.0, 20.0, 40.0, 80.0, 160.0, 170.0])
+        self.assertEqual(call_times[0], 0.0)
+        self.assertEqual(call_times[-1], 600.0)
+
+    def test_transient_recovers_on_later_exponential_retry(self) -> None:
         calls: list[list[str]] = []
         sleeps: list[float] = []
 
@@ -328,8 +358,6 @@ class ProviderExecutionTests(unittest.TestCase):
             {},
             self.workdir,
             run_cmd=recover_on_4th,
-            retry_delay_sec=10.0,
-            max_retries=3,
             sleep_fn=sleeps.append,
         )
         self.assertEqual(res.status, "ok")
@@ -366,8 +394,6 @@ class ProviderExecutionTests(unittest.TestCase):
             {},
             run_cmd=fake_run,
             quota_probe=flaky_probe,
-            retry_delay_sec=10.0,
-            max_retries=3,
             sleep_fn=sleeps.append,
         )
         self.assertEqual(probe_calls, 3)
@@ -375,3 +401,23 @@ class ProviderExecutionTests(unittest.TestCase):
         self.assertFalse(cli_called)
         self.assertEqual(res.status, "skipped")
         self.assertIn("长周期冷却", res.detail)
+
+        # Deterministic 404 on usage API does not burn retry budget.
+        calls_404 = 0
+        sleeps_404: list[float] = []
+
+        def probe_404(_name, _cfg):
+            nonlocal calls_404
+            calls_404 += 1
+            return QuotaSnapshot("Codex", error="HTTP 404")
+
+        run_single_provider(
+            "codex",
+            self.cfg,
+            {},
+            run_cmd=lambda _a, _e, _c, _t: (0, '{"type":"turn.completed","usage":{"input_tokens":1,"output_tokens":1}}', "", False),
+            quota_probe=probe_404,
+            sleep_fn=sleeps_404.append,
+        )
+        self.assertEqual(calls_404, 2)  # 1 preflight + 1 post-ping, zero retries
+        self.assertEqual(sleeps_404, [])

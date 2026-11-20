@@ -84,6 +84,15 @@ RunCmd = Callable[[list[str], dict[str, str], Path, int], tuple[int | None, str,
 # Suppress a second ping when a follow-up lands next to a fixed cron run.
 _RECENT_PING = timedelta(minutes=15)
 
+# Exponential backoff defaults for transient network/routing failures:
+# 6 retries (10s -> 20s -> 40s -> 80s -> 160s -> 290s) capped to a 10-minute window
+# so the final retry fires at +10m from the first attempt.
+DEFAULT_RETRY_DELAY_SEC = 10.0
+DEFAULT_MAX_RETRIES = 6
+DEFAULT_RETRY_WINDOW_SEC = 600.0
+DEFAULT_PROBE_MAX_RETRIES = 5
+DEFAULT_PROBE_RETRY_DELAY_SEC = 5.0
+
 
 @contextmanager
 def acquire_lock(lock_path: Path) -> Iterator[bool]:
@@ -681,18 +690,20 @@ def execute_with_fallback(
     workdir: Path,
     run_cmd: RunCmd = default_run_cmd,
     timeout_sec: int = 90,
-    retry_delay_sec: float = 10.0,
-    max_retries: int = 3,
+    retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_window_sec: float = DEFAULT_RETRY_WINDOW_SEC,
     sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
     log_fn: Callable[[str], None] = lambda _msg: None,
 ) -> PingResult:
-    """Run Tier 1 with exponential backoff on transient failures, and fall back only when safe."""
-    started = time.monotonic()
+    """Run Tier 1 with bounded exponential backoff on transient failures, and fall back only when safe."""
+    started = monotonic_fn()
 
     log_fn(f"→ {provider_label} [Tier 1: {tier1.model}]")
     rc, stdout, stderr, timed_out = run_cmd(tier1.argv, env, workdir, timeout_sec)
     if rc == 0:
-        elapsed = time.monotonic() - started
+        elapsed = monotonic_fn() - started
         usage = _parse_usage_for(provider_key, stdout)
         tok_note = f" [{usage.format_short()}]" if usage else ""
         log_fn(f"✓ {provider_label} OK [Tier 1: {tier1.model}] ({elapsed:.1f}s){tok_note}")
@@ -711,7 +722,7 @@ def execute_with_fallback(
     log_fn(f"✗ {provider_label} Tier 1 failed ({kind.value}): {first_summary}")
 
     if kind == ErrorKind.AUTH_OR_QUOTA:
-        elapsed = time.monotonic() - started
+        elapsed = monotonic_fn() - started
         return PingResult(
             provider=provider_label,
             status="fail",
@@ -722,13 +733,19 @@ def execute_with_fallback(
         )
 
     retry_budget = max(0, max_retries) if kind == ErrorKind.TRANSIENT else (1 if kind == ErrorKind.UNKNOWN and max_retries > 0 else 0)
+    slept_total = 0.0
     for attempt in range(retry_budget):
-        delay = retry_delay_sec * (2**attempt)
+        effective_elapsed = max(monotonic_fn() - started, slept_total)
+        remaining = retry_window_sec - effective_elapsed
+        if remaining <= 0:
+            break
+        delay = min(retry_delay_sec * (2**attempt), remaining)
         log_fn(f"↻ {provider_label} retrying Tier 1 ({attempt + 1}/{retry_budget}) after {delay:.0f}s...")
         sleep_fn(delay)
+        slept_total += delay
         rc, stdout, stderr, timed_out = run_cmd(tier1.argv, env, workdir, timeout_sec)
         if rc == 0:
-            elapsed = time.monotonic() - started
+            elapsed = monotonic_fn() - started
             usage = _parse_usage_for(provider_key, stdout)
             tok_note = f" [{usage.format_short()}]" if usage else ""
             log_fn(f"✓ {provider_label} OK on retry {attempt + 1} [Tier 1: {tier1.model}] ({elapsed:.1f}s){tok_note}")
@@ -746,7 +763,7 @@ def execute_with_fallback(
         first_summary = extract_error_summary(combined)
         log_fn(f"✗ {provider_label} Tier 1 retry {attempt + 1} failed ({kind.value}): {first_summary}")
         if kind == ErrorKind.AUTH_OR_QUOTA:
-            elapsed = time.monotonic() - started
+            elapsed = monotonic_fn() - started
             return PingResult(
                 provider=provider_label,
                 status="fail",
@@ -761,7 +778,7 @@ def execute_with_fallback(
             break
 
     if kind == ErrorKind.TRANSIENT:
-        elapsed = time.monotonic() - started
+        elapsed = monotonic_fn() - started
         return PingResult(
             provider=provider_label,
             status="fail",
@@ -776,7 +793,7 @@ def execute_with_fallback(
         log_fn(f"⚠ {provider_label} trying Tier {candidate.tier} ({candidate.model})...")
         rc, fb_out, fb_err, fb_timed_out = run_cmd(candidate.argv, env, workdir, timeout_sec)
         if rc == 0:
-            elapsed = time.monotonic() - started
+            elapsed = monotonic_fn() - started
             usage = _parse_usage_for(provider_key, fb_out)
             detail = f"Tier 1({tier1.model}) 失败 [{first_summary}]，已降级 Tier {candidate.tier}({candidate.model})"
             log_fn(f"⚠ {provider_label} DEGRADED OK [Tier {candidate.tier}: {candidate.model}] ({elapsed:.1f}s)")
@@ -798,7 +815,7 @@ def execute_with_fallback(
             last_detail = f"{fb_kind.value}: {last_detail}"
             break
 
-    elapsed = time.monotonic() - started
+    elapsed = monotonic_fn() - started
     return PingResult(
         provider=provider_label,
         status="fail",
@@ -815,6 +832,8 @@ def _is_retryable_probe_error(snap: QuotaSnapshot) -> bool:
     lower = snap.error.lower()
     if lower.startswith("missing ") or "no oauth credentials" in lower:
         return False
+    if any(code in lower for code in ("http 400", "http 401", "http 403", "http 404", "http 410")):
+        return False
     return True
 
 
@@ -824,8 +843,8 @@ def _probe_quota_with_retry(
     cfg: AppConfig,
     quota_probe: Callable[[str, AppConfig], QuotaSnapshot],
     *,
-    max_retries: int = 3,
-    base_delay_sec: float = 5.0,
+    max_retries: int = DEFAULT_PROBE_MAX_RETRIES,
+    base_delay_sec: float = DEFAULT_PROBE_RETRY_DELAY_SEC,
     sleep_fn: Callable[[float], None] = time.sleep,
     log_fn: Callable[[str], None] = lambda _msg: None,
 ) -> QuotaSnapshot:
@@ -859,8 +878,9 @@ def run_single_provider(
     run_cmd: RunCmd = default_run_cmd,
     quota_probe: Callable[[str, AppConfig], QuotaSnapshot] = probe_quota,
     timeout_sec: int = 90,
-    retry_delay_sec: float = 10.0,
-    max_retries: int = 3,
+    retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_window_sec: float = DEFAULT_RETRY_WINDOW_SEC,
     sleep_fn: Callable[[float], None] = time.sleep,
     log_fn: Callable[[str], None] = lambda _msg: None,
     preflight: bool = True,
@@ -896,6 +916,7 @@ def run_single_provider(
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
             max_retries=max_retries,
+            retry_window_sec=retry_window_sec,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
             preflight=preflight,
@@ -916,8 +937,9 @@ def _run_single_provider_locked(
     run_cmd: RunCmd = default_run_cmd,
     quota_probe: Callable[[str, AppConfig], QuotaSnapshot] = probe_quota,
     timeout_sec: int = 90,
-    retry_delay_sec: float = 10.0,
-    max_retries: int = 3,
+    retry_delay_sec: float = DEFAULT_RETRY_DELAY_SEC,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    retry_window_sec: float = DEFAULT_RETRY_WINDOW_SEC,
     sleep_fn: Callable[[float], None] = time.sleep,
     log_fn: Callable[[str], None] = lambda _msg: None,
     preflight: bool = True,
@@ -934,7 +956,7 @@ def _run_single_provider_locked(
             provider_label,
             cfg,
             quota_probe,
-            max_retries=max_retries,
+            max_retries=min(max_retries, DEFAULT_PROBE_MAX_RETRIES),
             base_delay_sec=max(1.0, retry_delay_sec / 2.0),
             sleep_fn=sleep_fn,
             log_fn=log_fn,
@@ -970,6 +992,7 @@ def _run_single_provider_locked(
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
             max_retries=max_retries,
+            retry_window_sec=retry_window_sec,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
@@ -987,6 +1010,7 @@ def _run_single_provider_locked(
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
             max_retries=max_retries,
+            retry_window_sec=retry_window_sec,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
@@ -1004,6 +1028,7 @@ def _run_single_provider_locked(
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
             max_retries=max_retries,
+            retry_window_sec=retry_window_sec,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
@@ -1021,6 +1046,7 @@ def _run_single_provider_locked(
             timeout_sec=timeout_sec,
             retry_delay_sec=retry_delay_sec,
             max_retries=max_retries,
+            retry_window_sec=retry_window_sec,
             sleep_fn=sleep_fn,
             log_fn=log_fn,
         )
